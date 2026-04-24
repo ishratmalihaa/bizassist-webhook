@@ -42,7 +42,7 @@ async function getAIReply(message) {
       { role: 'system', content: 'You are a helpful shop assistant. Reply in Bengali or English based on customer message. Be concise and helpful.' },
       { role: 'user', content: message }
     ],
-    model: 'llama-3.1-8b-instant',
+    model: 'llama3-70b-8192',
   });
   return chat.choices[0].message.content;
 }
