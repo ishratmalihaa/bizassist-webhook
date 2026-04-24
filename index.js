@@ -12,6 +12,14 @@ const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
 
 // INIT GROQ
 const groq = new Groq({ apiKey: GROQ_API_KEY });
+const products = [
+  { name: "nails", price: 120, colors: ["red", "pink", "blue"] },
+  { name: "bracelet", price: 250 }
+];
+
+function findProduct(message) {
+  return products.find(p => message.toLowerCase().includes(p.name));
+}
 
 // duplicate protection
 const processedMessages = new Set();
@@ -52,7 +60,19 @@ app.post('/webhook', async (req, res) => {
 
         console.log('User:', userMessage);
 
-        const aiReply = await getAIReply(userMessage);
+        const product = findProduct(userMessage);
+
+let aiReply;
+
+if (product) {
+  if (userMessage.toLowerCase().includes("color")) {
+    aiReply = `Available colors: ${product.colors?.join(", ") || "Not specified"}`;
+  } else {
+    aiReply = `Price is ${product.price} taka.`;
+  }
+} else {
+  aiReply = "Not available";
+}
         console.log('AI:', aiReply);
 
         await sendMessage(senderId, aiReply);
