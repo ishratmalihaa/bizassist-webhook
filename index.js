@@ -1,17 +1,31 @@
 const express = require('express');
 const Groq = require('groq-sdk');
 const axios = require('axios');
-const { createClient } = require('@supabase/supabase-js');
-
 const app = express();
 app.use(express.json());
 
 const VERIFY_TOKEN = 'bizassist123';
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+const WEBHOOK_API_KEY = process.env.WEBHOOK_API_KEY;
+
+const LOVABLE_API_URL = 'https://project--b95f1c78-6680-4b45-b2e2-e1d1fbebf00d.lovable.app/api/public/get-products';
+const SELLER_ID = '67f55dc2-41e9-410c-8c6b-289ebee08118';
 
 const processedMessages = new Set();
+
+async function getProductsFromDB() {
+  try {
+    const res = await axios.get(
+      `${LOVABLE_API_URL}?seller_id=${SELLER_ID}`,
+      { headers: { 'x-api-key': WEBHOOK_API_KEY } }
+    );
+    return res.data;
+  } catch (err) {
+    console.error('API Error:', err.response?.data || err.message);
+    return [];
+  }
+}
 
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
@@ -48,20 +62,32 @@ app.post('/webhook', async (req, res) => {
 
 async function generateReply(userMessage) {
   try {
-    const { data: products, error } = await supabase
-      .from('products')
-      .select('product_name, price_bdt, stock_availability, color, description');
+    const products = await getProductsFromDB() || [];
 
-    if (error) {
-      console.error('Supabase error:', error);
-      return 'Sorry, something went wrong.';
+    if (products.length === 0) {
+      return 'Sorry, no products available right now.';
     }
 
-    console.log('Products from DB:', products);
+    const msg = userMessage.toLowerCase();
 
-    const productList = products.map(p =>
-      `${p.product_name}: price ${p.price_bdt} BDT, color: ${p.color}, stock: ${p.stock_availability}, description: ${p.description}`
-    ).join('\n');
+    const matchedProduct = products.find(p =>
+      p.name && msg.includes(p.name.toLowerCase())
+    );
+
+    if (!matchedProduct) {
+      return 'Not available';
+    }
+
+    if (msg.includes('color') || msg.includes('colour') ||
+        msg.includes('rong') || msg.includes('রং')) {
+      return `Available colors: ${matchedProduct.colors || 'Not specified'}`;
+    }
+
+    if (msg.includes('price') || msg.includes('dam') ||
+        msg.includes('daam') || msg.includes('koto') ||
+        msg.includes('কত')) {
+      return `Price is ${matchedProduct.price} taka`;
+    }
 
     const chat = await groq.chat.completions.create({
       model: 'llama-3.3-70b-versatile',
@@ -70,24 +96,16 @@ async function generateReply(userMessage) {
         {
           role: 'system',
           content: `You are BizAssist AI, a helpful shop assistant.
-Here are the available products:
-${productList}
-
+Product info: ${matchedProduct.name}: price ${matchedProduct.price} BDT, color: ${matchedProduct.colors}, stock: ${matchedProduct.stock}
 RULES:
-- Reply in the SAME language as the customer (Bengali/English/Banglish)
-- Keep reply SHORT (1-2 sentences max)
-- Only use product info from the list above
-- If product not found, say not available
-- Never make up prices or products
-- If customer asks for price, give exact price from the list`
+- Reply in SAME language as customer (Bengali/English/Banglish)
+- Keep reply SHORT (1-2 sentences only)
+- Only use the product info given above
+- Never make up prices or products`
         },
-        {
-          role: 'user',
-          content: userMessage
-        }
+        { role: 'user', content: userMessage }
       ]
     });
-
     return chat.choices[0].message.content.trim();
   } catch (error) {
     console.error('Error:', error);
@@ -99,10 +117,7 @@ async function sendMessage(recipientId, message) {
   try {
     await axios.post(
       `https://graph.facebook.com/v18.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`,
-      {
-        recipient: { id: recipientId },
-        message: { text: message }
-      }
+      { recipient: { id: recipientId }, message: { text: message } }
     );
     console.log('Sent ✔');
   } catch (err) {
@@ -111,6 +126,5 @@ async function sendMessage(recipientId, message) {
 }
 
 app.get('/', (req, res) => res.send('BizAssist Webhook Running! 🚀'));
-
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
