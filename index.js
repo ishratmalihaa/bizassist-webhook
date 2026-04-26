@@ -20,7 +20,11 @@ async function getProductsFromDB() {
       `${LOVABLE_API_URL}?seller_id=${SELLER_ID}`,
       { headers: { 'x-api-key': WEBHOOK_API_KEY } }
     );
-    return res.data;
+    const data = res.data;
+    if (Array.isArray(data)) return data;
+    if (Array.isArray(data.products)) return data.products;
+    if (Array.isArray(data.data)) return data.data;
+    return [];
   } catch (err) {
     console.error('API Error:', err.response?.data || err.message);
     return [];
@@ -113,22 +117,16 @@ RULES:
   }
 }
 
-async function getProductsFromDB() {
+async function sendMessage(recipientId, message) {
   try {
-    const res = await axios.get(
-      `${LOVABLE_API_URL}?seller_id=${SELLER_ID}`,
-      { headers: { 'x-api-key': WEBHOOK_API_KEY } }
+    await axios.post(
+      `https://graph.facebook.com/v18.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`,
+      { recipient: { id: recipientId }, message: { text: message } }
     );
-    const data = res.data;
-    if (Array.isArray(data)) return data;
-    if (Array.isArray(data.products)) return data.products;
-    if (Array.isArray(data.data)) return data.data;
-    return [];
+    console.log('Sent ✔');
   } catch (err) {
-    console.error('API Error:', err.response?.data || err.message);
-    return [];
+    console.error('Send Error:', err.response?.data || err.message);
   }
-}
 }
 
 app.get('/', (req, res) => res.send('BizAssist Webhook Running! 🚀'));
