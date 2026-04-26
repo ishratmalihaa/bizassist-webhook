@@ -13,6 +13,7 @@ const LOVABLE_API_URL = 'https://project--b95f1c78-6680-4b45-b2e2-e1d1fbebf00d.l
 const SELLER_ID = '67f55dc2-41e9-410c-8c6b-289ebee08118';
 
 const processedMessages = new Set();
+const conversationHistory = new Map();
 
 async function getProductsFromDB() {
   try {
@@ -29,6 +30,26 @@ async function getProductsFromDB() {
     console.error('API Error:', err.response?.data || err.message);
     return [];
   }
+}
+
+function detectLanguage(msg) {
+  const bengaliChars = /[\u0980-\u09FF]/;
+  const banglishWords = /\b(er|koto|dam|ache|ki|nai|daam|kori|hobe|theke|ta|te|ke|re|taka|jabe|chai|bol|dik|vai|bhai|apu)\b/i;
+  if (bengaliChars.test(msg)) return 'bengali';
+  if (banglishWords.test(msg)) return 'banglish';
+  return 'english';
+}
+
+function findProduct(products, msg) {
+  return products.find(p =>
+    p.product_name && msg.includes(p.product_name.toLowerCase())
+  );
+}
+
+function formatReply(lang, bengali, banglish, english) {
+  if (lang === 'bengali') return bengali;
+  if (lang === 'banglish') return banglish;
+  return english;
 }
 
 app.get('/webhook', (req, res) => {
@@ -56,7 +77,7 @@ app.post('/webhook', async (req, res) => {
         processedMessages.add(messageId);
         setTimeout(() => processedMessages.delete(messageId), 60000);
         console.log('Customer:', userMessage);
-        const reply = await generateReply(userMessage);
+        const reply = await generateReply(senderId, userMessage);
         console.log('Reply:', reply);
         await sendMessage(senderId, reply);
       }
@@ -64,7 +85,7 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-async function generateReply(userMessage) {
+async function generateReply(senderId, userMessage) {
   try {
     const products = await getProductsFromDB() || [];
 
@@ -73,24 +94,62 @@ async function generateReply(userMessage) {
     }
 
     const msg = userMessage.toLowerCase();
+    const lang = detectLanguage(userMessage);
 
-    const matchedProduct = products.find(p =>
-      p.product_name && msg.includes(p.product_name.toLowerCase())
-    );
+    if (!conversationHistory.has(senderId)) {
+      conversationHistory.set(senderId, { lastProduct: null });
+    }
+    const userHistory = conversationHistory.get(senderId);
+
+    let matchedProduct = findProduct(products, msg);
+
+    if (!matchedProduct && userHistory.lastProduct) {
+      matchedProduct = userHistory.lastProduct;
+    }
+
+    if (matchedProduct) {
+      userHistory.lastProduct = matchedProduct;
+    }
 
     if (!matchedProduct) {
-      return 'Not available';
+      return formatReply(lang,
+        'কোন product এর কথা বলছেন বলুন।',
+        'Kon product er kotha bolchen?',
+        'Which product are you asking about?'
+      );
     }
+
+    const name = matchedProduct.product_name;
+    const price = matchedProduct.price_bdt;
+    const color = matchedProduct.color || '';
+    const stock = matchedProduct.stock_availability;
 
     if (msg.includes('color') || msg.includes('colour') ||
         msg.includes('rong') || msg.includes('রং')) {
-      return `Available colors: ${matchedProduct.color || 'Not specified'}`;
+      return formatReply(lang,
+        `${name} এর রং: ${color || 'জানা নেই'}`,
+        `${name} er color: ${color || 'nai'}`,
+        `${name} colors: ${color || 'Not specified'}`
+      );
     }
 
     if (msg.includes('price') || msg.includes('dam') ||
         msg.includes('daam') || msg.includes('koto') ||
         msg.includes('কত')) {
-      return `Price is ${matchedProduct.price_bdt} taka`;
+      return formatReply(lang,
+        `${name} এর দাম ${price} টাকা।`,
+        `${name} er dam ${price} taka.`,
+        `${name} price is ${price} taka.`
+      );
+    }
+
+    if (msg.includes('stock') || msg.includes('ache') || msg.includes('available')) {
+      const inStock = stock === 'in_stock';
+      return formatReply(lang,
+        inStock ? `${name} এখন available আছে।` : `${name} এখন নেই।`,
+        inStock ? `${name} ache.` : `${name} nai ekhon.`,
+        inStock ? `${name} is in stock.` : `${name} is out of stock.`
+      );
     }
 
     const chat = await groq.chat.completions.create({
@@ -100,9 +159,12 @@ async function generateReply(userMessage) {
         {
           role: 'system',
           content: `You are BizAssist AI, a helpful shop assistant.
-Product info: ${matchedProduct.product_name}: price ${matchedProduct.price_bdt} BDT, color: ${matchedProduct.color}, stock: ${matchedProduct.stock_availability}
+Product info: ${name}: price ${price} BDT, color: ${color}, stock: ${stock}
+Detected language: ${lang}
 RULES:
-- Reply in SAME language as customer (Bengali/English/Banglish)
+- If language is "bengali": reply in pure Bengali script
+- If language is "banglish": reply in Banglish (Bengali words in English letters)
+- If language is "english": reply in English
 - Keep reply SHORT (1-2 sentences only)
 - Only use the product info given above
 - Never make up prices or products`
