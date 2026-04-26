@@ -67,6 +67,7 @@ app.post('/webhook', async (req, res) => {
 async function generateReply(userMessage) {
   try {
     const products = await getProductsFromDB() || [];
+    console.log('Products data:', JSON.stringify(products));
 
     if (products.length === 0) {
       return 'Sorry, no products available right now.';
