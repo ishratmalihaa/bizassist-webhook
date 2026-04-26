@@ -113,16 +113,22 @@ RULES:
   }
 }
 
-async function sendMessage(recipientId, message) {
+async function getProductsFromDB() {
   try {
-    await axios.post(
-      `https://graph.facebook.com/v18.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`,
-      { recipient: { id: recipientId }, message: { text: message } }
+    const res = await axios.get(
+      `${LOVABLE_API_URL}?seller_id=${SELLER_ID}`,
+      { headers: { 'x-api-key': WEBHOOK_API_KEY } }
     );
-    console.log('Sent ✔');
+    const data = res.data;
+    if (Array.isArray(data)) return data;
+    if (Array.isArray(data.products)) return data.products;
+    if (Array.isArray(data.data)) return data.data;
+    return [];
   } catch (err) {
-    console.error('Send Error:', err.response?.data || err.message);
+    console.error('API Error:', err.response?.data || err.message);
+    return [];
   }
+}
 }
 
 app.get('/', (req, res) => res.send('BizAssist Webhook Running! 🚀'));
