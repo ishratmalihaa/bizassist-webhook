@@ -67,7 +67,6 @@ app.post('/webhook', async (req, res) => {
 async function generateReply(userMessage) {
   try {
     const products = await getProductsFromDB() || [];
-    console.log('Products data:', JSON.stringify(products));
 
     if (products.length === 0) {
       return 'Sorry, no products available right now.';
@@ -76,7 +75,7 @@ async function generateReply(userMessage) {
     const msg = userMessage.toLowerCase();
 
     const matchedProduct = products.find(p =>
-      p.name && msg.includes(p.name.toLowerCase())
+      p.product_name && msg.includes(p.product_name.toLowerCase())
     );
 
     if (!matchedProduct) {
@@ -85,13 +84,13 @@ async function generateReply(userMessage) {
 
     if (msg.includes('color') || msg.includes('colour') ||
         msg.includes('rong') || msg.includes('রং')) {
-      return `Available colors: ${matchedProduct.colors || 'Not specified'}`;
+      return `Available colors: ${matchedProduct.color || 'Not specified'}`;
     }
 
     if (msg.includes('price') || msg.includes('dam') ||
         msg.includes('daam') || msg.includes('koto') ||
         msg.includes('কত')) {
-      return `Price is ${matchedProduct.price} taka`;
+      return `Price is ${matchedProduct.price_bdt} taka`;
     }
 
     const chat = await groq.chat.completions.create({
@@ -101,7 +100,7 @@ async function generateReply(userMessage) {
         {
           role: 'system',
           content: `You are BizAssist AI, a helpful shop assistant.
-Product info: ${matchedProduct.name}: price ${matchedProduct.price} BDT, color: ${matchedProduct.colors}, stock: ${matchedProduct.stock}
+Product info: ${matchedProduct.product_name}: price ${matchedProduct.price_bdt} BDT, color: ${matchedProduct.color}, stock: ${matchedProduct.stock_availability}
 RULES:
 - Reply in SAME language as customer (Bengali/English/Banglish)
 - Keep reply SHORT (1-2 sentences only)
