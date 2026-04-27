@@ -1,279 +1,312 @@
 const express = require('express');
 const Groq = require('groq-sdk');
 const axios = require('axios');
+
 const app = express();
 app.use(express.json());
 
 const VERIFY_TOKEN = 'bizassist123';
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+
 const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
 const WEBHOOK_API_KEY = process.env.WEBHOOK_API_KEY;
-
-const LOVABLE_API_URL = 'https://project--b95f1c78-6680-4b45-b2e2-e1d1fbebf00d.lovable.app/api/public/get-products';
-const SELLER_ID = '67f55dc2-41e9-410c-8c6b-289ebee08118';
+const LOVABLE_API_URL = process.env.LOVABLE_API_URL;
+const SELLER_ID = process.env.SELLER_ID;
 
 const processedMessages = new Set();
 const conversationHistory = new Map();
 
+/* =========================
+   FETCH PRODUCTS
+========================= */
 async function getProductsFromDB() {
   try {
     const res = await axios.get(
       `${LOVABLE_API_URL}?seller_id=${SELLER_ID}`,
       { headers: { 'x-api-key': WEBHOOK_API_KEY } }
     );
+
     const data = res.data;
+
     if (Array.isArray(data)) return data;
     if (Array.isArray(data.products)) return data.products;
     if (Array.isArray(data.data)) return data.data;
+
     return [];
   } catch (err) {
-    console.error('API Error:', err.response?.data || err.message);
+    console.error("API Error:", err.response?.data || err.message);
     return [];
   }
 }
 
+/* =========================
+   LANGUAGE DETECT
+========================= */
 function detectLanguage(msg) {
-  const bengaliChars = /[\u0980-\u09FF]/;
-  const banglishWords = /\b(er|koto|dam|ache|ki|nai|daam|kori|hobe|theke|ta|te|ke|re|taka|jabe|chai|bol|dik|vai|bhai|apu)\b/i;
-  if (bengaliChars.test(msg)) return 'bengali';
-  if (banglishWords.test(msg)) return 'banglish';
-  return 'english';
+  const bengali = /[\u0980-\u09FF]/;
+  const banglish = /\b(er|koto|dam|ache|nibo|kinbo|taka)\b/i;
+
+  if (bengali.test(msg)) return "bengali";
+  if (banglish.test(msg)) return "banglish";
+  return "english";
 }
 
-// FIXED: longest match আগে check করে, তাই "gold braclet" সঠিকভাবে match হবে
+function formatReply(lang, bn, bl, en) {
+  if (lang === "bengali") return bn;
+  if (lang === "banglish") return bl;
+  return en;
+}
+
+/* =========================
+   FUZZY MATCH
+========================= */
+function similarity(a, b) {
+  a = a.toLowerCase();
+  b = b.toLowerCase();
+
+  let matches = 0;
+  for (let i = 0; i < Math.min(a.length, b.length); i++) {
+    if (a[i] === b[i]) matches++;
+  }
+
+  return matches / Math.max(a.length, b.length);
+}
+
 function findProduct(products, msg) {
-  const matches = products.filter(p =>
-    p.product_name && msg.includes(p.product_name.toLowerCase())
-  );
-  if (matches.length === 0) return null;
-  // সবচেয়ে লম্বা product name যেটা match হয়েছে সেটা return করো
-  return matches.sort((a, b) => b.product_name.length - a.product_name.length)[0];
+  let bestMatch = null;
+  let bestScore = 0;
+
+  for (let p of products) {
+    const name = (p.product_name || "").toLowerCase();
+
+    let score = similarity(msg, name);
+
+    if (msg.includes(name) || name.includes(msg)) score += 0.5;
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestMatch = p;
+    }
+  }
+
+  return bestScore > 0.4 ? bestMatch : null;
 }
 
-function formatReply(lang, bengali, banglish, english) {
-  if (lang === 'bengali') return bengali;
-  if (lang === 'banglish') return banglish;
-  return english;
-}
-
-async function getImageAsBase64(imageUrl) {
+/* =========================
+   AI MATCH (fallback)
+========================= */
+async function aiFindProduct(products, userMessage) {
   try {
-    const response = await axios.get(imageUrl, {
-      responseType: 'arraybuffer',
+    const list = products.map(p => p.product_name).join(", ");
+
+    const res = await groq.chat.completions.create({
+      model: "llama-3.3-70b-versatile",
+      temperature: 0,
+      messages: [
+        {
+          role: "system",
+          content: `Match user message to product.
+
+Products:
+${list}
+
+Return ONLY product name or NONE.`
+        },
+        { role: "user", content: userMessage }
+      ]
+    });
+
+    const result = res.choices[0].message.content.trim();
+
+    if (result === "NONE") return null;
+
+    return products.find(p =>
+      p.product_name.toLowerCase() === result.toLowerCase()
+    );
+  } catch {
+    return null;
+  }
+}
+
+/* =========================
+   IMAGE PROCESS
+========================= */
+async function getImage(url) {
+  try {
+    const res = await axios.get(url, {
+      responseType: "arraybuffer",
       headers: { Authorization: `Bearer ${PAGE_ACCESS_TOKEN}` }
     });
-    const base64 = Buffer.from(response.data, 'binary').toString('base64');
-    const mimeType = response.headers['content-type'] || 'image/jpeg';
-    return { base64, mimeType };
-  } catch (err) {
-    console.error('Image fetch error:', err.message);
+
+    return {
+      base64: Buffer.from(res.data).toString("base64"),
+      type: res.headers["content-type"]
+    };
+  } catch {
     return null;
   }
 }
 
-async function analyzeImageWithProducts(imageUrl, products) {
-  try {
-    const imgData = await getImageAsBase64(imageUrl);
-    if (!imgData) return null;
+async function analyzeImage(imageUrl, products) {
+  const img = await getImage(imageUrl);
+  if (!img) return "Image failed.";
 
-    const productList = products.map(p =>
-      `- ${p.product_name} (price: ${p.price_bdt} BDT, color: ${p.color}, stock: ${p.stock_availability})`
-    ).join('\n');
+  const list = products.map(p =>
+    `${p.product_name} (${p.price_bdt} BDT)`
+  ).join("\n");
 
-    const response = await groq.chat.completions.create({
-      model: 'meta-llama/llama-4-scout-17b-16e-instruct',
-      max_tokens: 300,
-      messages: [
-        {
-          role: 'user',
-          content: [
-            {
-              type: 'image_url',
-              image_url: {
-                url: `data:${imgData.mimeType};base64,${imgData.base64}`
-              }
-            },
-            {
-              type: 'text',
-              text: `You are a shop assistant. Look at this image and check if it matches any product from our shop.
-
-Our products:
-${productList}
-
-If the image matches a product, reply with the product name and its details (price, color, availability).
-If it does not match any product, say "This product is not in our shop."
-Keep reply SHORT (2-3 sentences). Reply in English.`
-            }
-          ]
-        }
-      ]
-    });
-
-    return response.choices[0].message.content.trim();
-  } catch (err) {
-    console.error('Vision error:', err.message);
-    return null;
-  }
-}
-
-app.get('/webhook', (req, res) => {
-  const mode = req.query['hub.mode'];
-  const token = req.query['hub.verify_token'];
-  const challenge = req.query['hub.challenge'];
-  if (mode === 'subscribe' && token === VERIFY_TOKEN) {
-    return res.status(200).send(challenge);
-  }
-  return res.sendStatus(403);
-});
-
-app.post('/webhook', async (req, res) => {
-  res.status(200).send('EVENT_RECEIVED');
-  const body = req.body;
-  if (body.object === 'page') {
-    for (const entry of body.entry || []) {
-      for (const event of entry.messaging || []) {
-        if (!event.message || event.message.is_echo) continue;
-        const messageId = event.message.mid;
-        const senderId = event.sender.id;
-        if (processedMessages.has(messageId)) continue;
-        processedMessages.add(messageId);
-        setTimeout(() => processedMessages.delete(messageId), 60000);
-
-        const userMessage = event.message.text;
-        const attachments = event.message.attachments;
-
-        let reply;
-
-        if (attachments && attachments.length > 0) {
-          const imageAttachment = attachments.find(a => a.type === 'image');
-          if (imageAttachment) {
-            console.log('Customer sent an image');
-            const products = await getProductsFromDB();
-            reply = await analyzeImageWithProducts(imageAttachment.payload.url, products);
-            if (!reply) reply = 'Sorry, I could not analyze the image right now.';
-          } else {
-            reply = 'Please send a text message or product image.';
-          }
-        } else if (userMessage) {
-          console.log('Customer:', userMessage);
-          reply = await generateReply(senderId, userMessage);
-        } else {
-          continue;
-        }
-
-        console.log('Reply:', reply);
-        await sendMessage(senderId, reply);
+  const res = await groq.chat.completions.create({
+    model: "llama-3.3-70b-versatile",
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "image_url", image_url: { url: `data:${img.type};base64,${img.base64}` } },
+          { type: "text", text: `Match image to product:\n${list}` }
+        ]
       }
+    ]
+  });
+
+  return res.choices[0].message.content;
+}
+
+/* =========================
+   WEBHOOK VERIFY
+========================= */
+app.get("/webhook", (req, res) => {
+  if (req.query["hub.verify_token"] === VERIFY_TOKEN) {
+    return res.send(req.query["hub.challenge"]);
+  }
+  res.sendStatus(403);
+});
+
+/* =========================
+   MAIN WEBHOOK
+========================= */
+app.post("/webhook", async (req, res) => {
+  res.sendStatus(200);
+
+  const body = req.body;
+
+  for (const entry of body.entry || []) {
+    for (const event of entry.messaging || []) {
+
+      if (!event.message || event.message.is_echo) continue;
+
+      const senderId = event.sender.id;
+      const msgId = event.message.mid;
+
+      if (processedMessages.has(msgId)) continue;
+      processedMessages.add(msgId);
+      setTimeout(() => processedMessages.delete(msgId), 60000);
+
+      const text = event.message.text;
+      const attachments = event.message.attachments;
+
+      let reply;
+
+      /* IMAGE */
+      if (attachments?.length) {
+        const img = attachments.find(a => a.type === "image");
+        if (img) {
+          const products = await getProductsFromDB();
+          reply = await analyzeImage(img.payload.url, products);
+        } else {
+          reply = "Send product image.";
+        }
+      }
+
+      /* TEXT */
+      else if (text) {
+        reply = await generateReply(senderId, text);
+      }
+
+      await sendMessage(senderId, reply);
     }
   }
 });
 
+/* =========================
+   GENERATE REPLY
+========================= */
 async function generateReply(senderId, userMessage) {
-  try {
-    const products = await getProductsFromDB() || [];
+  const products = await getProductsFromDB();
 
-    if (products.length === 0) {
-      return 'Sorry, no products available right now.';
-    }
+  const msg = userMessage.toLowerCase();
+  const lang = detectLanguage(userMessage);
 
-    const msg = userMessage.toLowerCase();
-    const lang = detectLanguage(userMessage);
-
-    if (!conversationHistory.has(senderId)) {
-      conversationHistory.set(senderId, { lastProduct: null });
-    }
-    const userHistory = conversationHistory.get(senderId);
-
-    let matchedProduct = findProduct(products, msg);
-
-    if (!matchedProduct && userHistory.lastProduct) {
-      matchedProduct = userHistory.lastProduct;
-    }
-
-    if (matchedProduct) {
-      userHistory.lastProduct = matchedProduct;
-    }
-
-    if (!matchedProduct) {
-      return formatReply(lang,
-        'কোন product এর কথা বলছেন বলুন।',
-        'Kon product er kotha bolchen?',
-        'Which product are you asking about?'
-      );
-    }
-
-    const name = matchedProduct.product_name;
-    const price = matchedProduct.price_bdt;
-    const color = matchedProduct.color || '';
-    const stock = matchedProduct.stock_availability;
-
-    if (msg.includes('color') || msg.includes('colour') ||
-        msg.includes('rong') || msg.includes('রং')) {
-      return formatReply(lang,
-        `${name} এর রং: ${color || 'জানা নেই'}`,
-        `${name} er color: ${color || 'nai'}`,
-        `${name} colors: ${color || 'Not specified'}`
-      );
-    }
-
-    if (msg.includes('price') || msg.includes('dam') ||
-        msg.includes('daam') || msg.includes('koto') ||
-        msg.includes('কত')) {
-      return formatReply(lang,
-        `${name} এর দাম ${price} টাকা।`,
-        `${name} er dam ${price} taka.`,
-        `${name} price is ${price} taka.`
-      );
-    }
-
-    if (msg.includes('stock') || msg.includes('ache') || msg.includes('available')) {
-      const inStock = stock === 'in_stock';
-      return formatReply(lang,
-        inStock ? `${name} এখন available আছে।` : `${name} এখন নেই।`,
-        inStock ? `${name} ache.` : `${name} nai ekhon.`,
-        inStock ? `${name} is in stock.` : `${name} is out of stock.`
-      );
-    }
-
-    const chat = await groq.chat.completions.create({
-      model: 'llama-3.3-70b-versatile',
-      temperature: 0.2,
-      messages: [
-        {
-          role: 'system',
-          content: `You are BizAssist AI, a helpful shop assistant.
-Product info: ${name}: price ${price} BDT, color: ${color}, stock: ${stock}
-Detected language: ${lang}
-RULES:
-- If language is "bengali": reply in pure Bengali script
-- If language is "banglish": reply in Banglish (Bengali words in English letters)
-- If language is "english": reply in English
-- Keep reply SHORT (1-2 sentences only)
-- Only use the product info given above
-- Never make up prices or products`
-        },
-        { role: 'user', content: userMessage }
-      ]
-    });
-    return chat.choices[0].message.content.trim();
-  } catch (error) {
-    console.error('Error:', error);
-    return 'Sorry, something went wrong.';
+  if (!conversationHistory.has(senderId)) {
+    conversationHistory.set(senderId, { last: null });
   }
-}
 
-async function sendMessage(recipientId, message) {
-  try {
-    await axios.post(
-      `https://graph.facebook.com/v18.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`,
-      { recipient: { id: recipientId }, message: { text: message } }
+  const history = conversationHistory.get(senderId);
+
+  let product = findProduct(products, msg);
+
+  if (!product) {
+    product = await aiFindProduct(products, userMessage);
+  }
+
+  if (!product && history.last) {
+    product = history.last;
+  }
+
+  if (!product) {
+    return formatReply(
+      lang,
+      "আপনি কোন product চান স্পষ্ট করে বলুন",
+      "Please clearly bolun kon product",
+      "Please specify the product"
     );
-    console.log('Sent ✔');
-  } catch (err) {
-    console.error('Send Error:', err.response?.data || err.message);
   }
+
+  history.last = product;
+
+  const name = product.product_name;
+  const price = product.price_bdt;
+  const stock = product.stock_quantity || 0;
+  const color = product.color || "";
+
+  if (msg.includes("stock") || msg.includes("koyta")) {
+    return `${name} stock ${stock} ta`;
+  }
+
+  if (msg.includes("price") || msg.includes("koto")) {
+    return `${name} price ${price} taka`;
+  }
+
+  if (msg.includes("color") || msg.includes("rong")) {
+    return `${name} colors: ${color}`;
+  }
+
+  if (msg.includes("order") || msg.includes("nibo")) {
+    return `To order ${name} 👍\nSend name, address, phone in inbox`;
+  }
+
+  if (msg.includes("image") || msg.includes("pic")) {
+    return `Check our page for ${name} images 👍`;
+  }
+
+  return `${name} available 👍 price ${price}`;
 }
 
-app.get('/', (req, res) => res.send('BizAssist Webhook Running! 🚀'));
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+/* =========================
+   SEND MESSAGE
+========================= */
+async function sendMessage(id, text) {
+  await axios.post(
+    `https://graph.facebook.com/v18.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`,
+    {
+      recipient: { id },
+      message: { text }
+    }
+  );
+}
+
+/* =========================
+   START
+========================= */
+app.get("/", (req, res) => res.send("Running"));
+
+app.listen(process.env.PORT || 3000);
