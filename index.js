@@ -40,16 +40,80 @@ function detectLanguage(msg) {
   return 'english';
 }
 
+// FIXED: longest match আগে check করে, তাই "gold braclet" সঠিকভাবে match হবে
 function findProduct(products, msg) {
-  return products.find(p =>
+  const matches = products.filter(p =>
     p.product_name && msg.includes(p.product_name.toLowerCase())
   );
+  if (matches.length === 0) return null;
+  // সবচেয়ে লম্বা product name যেটা match হয়েছে সেটা return করো
+  return matches.sort((a, b) => b.product_name.length - a.product_name.length)[0];
 }
 
 function formatReply(lang, bengali, banglish, english) {
   if (lang === 'bengali') return bengali;
   if (lang === 'banglish') return banglish;
   return english;
+}
+
+async function getImageAsBase64(imageUrl) {
+  try {
+    const response = await axios.get(imageUrl, {
+      responseType: 'arraybuffer',
+      headers: { Authorization: `Bearer ${PAGE_ACCESS_TOKEN}` }
+    });
+    const base64 = Buffer.from(response.data, 'binary').toString('base64');
+    const mimeType = response.headers['content-type'] || 'image/jpeg';
+    return { base64, mimeType };
+  } catch (err) {
+    console.error('Image fetch error:', err.message);
+    return null;
+  }
+}
+
+async function analyzeImageWithProducts(imageUrl, products) {
+  try {
+    const imgData = await getImageAsBase64(imageUrl);
+    if (!imgData) return null;
+
+    const productList = products.map(p =>
+      `- ${p.product_name} (price: ${p.price_bdt} BDT, color: ${p.color}, stock: ${p.stock_availability})`
+    ).join('\n');
+
+    const response = await groq.chat.completions.create({
+      model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+      max_tokens: 300,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'image_url',
+              image_url: {
+                url: `data:${imgData.mimeType};base64,${imgData.base64}`
+              }
+            },
+            {
+              type: 'text',
+              text: `You are a shop assistant. Look at this image and check if it matches any product from our shop.
+
+Our products:
+${productList}
+
+If the image matches a product, reply with the product name and its details (price, color, availability).
+If it does not match any product, say "This product is not in our shop."
+Keep reply SHORT (2-3 sentences). Reply in English.`
+            }
+          ]
+        }
+      ]
+    });
+
+    return response.choices[0].message.content.trim();
+  } catch (err) {
+    console.error('Vision error:', err.message);
+    return null;
+  }
 }
 
 app.get('/webhook', (req, res) => {
@@ -71,13 +135,32 @@ app.post('/webhook', async (req, res) => {
         if (!event.message || event.message.is_echo) continue;
         const messageId = event.message.mid;
         const senderId = event.sender.id;
-        const userMessage = event.message.text;
-        if (!userMessage) continue;
         if (processedMessages.has(messageId)) continue;
         processedMessages.add(messageId);
         setTimeout(() => processedMessages.delete(messageId), 60000);
-        console.log('Customer:', userMessage);
-        const reply = await generateReply(senderId, userMessage);
+
+        const userMessage = event.message.text;
+        const attachments = event.message.attachments;
+
+        let reply;
+
+        if (attachments && attachments.length > 0) {
+          const imageAttachment = attachments.find(a => a.type === 'image');
+          if (imageAttachment) {
+            console.log('Customer sent an image');
+            const products = await getProductsFromDB();
+            reply = await analyzeImageWithProducts(imageAttachment.payload.url, products);
+            if (!reply) reply = 'Sorry, I could not analyze the image right now.';
+          } else {
+            reply = 'Please send a text message or product image.';
+          }
+        } else if (userMessage) {
+          console.log('Customer:', userMessage);
+          reply = await generateReply(senderId, userMessage);
+        } else {
+          continue;
+        }
+
         console.log('Reply:', reply);
         await sendMessage(senderId, reply);
       }
