@@ -5,7 +5,6 @@ const app = express();
 app.use(express.json());
 
 /* ================= CONFIG ================= */
-
 const BASE =
   "https://project--b95f1c78-6680-4b45-b2e2-e1d1fbebf00d.lovable.app";
 
@@ -14,7 +13,7 @@ const ALERT_URL = `${BASE}/api/public/order-alert`;
 
 const SELLER_ID = "67f55dc2-41e9-410c-8c6b-289ebee08118";
 
-/* ================= SAFE STATE ================= */
+/* ================= MEMORY ================= */
 const seen = new Map();
 const history = new Map();
 
@@ -26,11 +25,13 @@ async function getProducts() {
   try {
     const res = await axios.get(`${PRODUCTS_URL}?seller_id=${SELLER_ID}`);
 
-    if (Array.isArray(res.data?.products)) return res.data.products;
-    if (Array.isArray(res.data)) return res.data;
+    const data = res.data;
+
+    if (Array.isArray(data)) return data;
+    if (Array.isArray(data?.products)) return data.products;
 
     return [];
-  } catch {
+  } catch (e) {
     return [];
   }
 }
@@ -64,7 +65,7 @@ function findProduct(products, msg) {
     }
   }
 
-  return score >= 0.3 ? best : null;
+  return score >= 0.4 ? best : null;
 }
 
 /* ================= AI ================= */
@@ -73,7 +74,7 @@ async function ai(sender, msg, products, h) {
 
   if (!Array.isArray(products)) products = [];
 
-  /* ===== GREETING ===== */
+  /* GREETING */
   if (/^(hi|hello|hey|halo|helo)$/i.test(msg)) {
     return "👋 Hello! What are you looking for?";
   }
@@ -82,7 +83,7 @@ async function ai(sender, msg, products, h) {
     return "👋 আসসালামু আলাইকুম! আপনি কী খুঁজছেন?";
   }
 
-  /* ===== INTENT ===== */
+  /* INTENT */
   const intent =
     /price|dam|koto/.test(msg)
       ? "price"
@@ -94,45 +95,41 @@ async function ai(sender, msg, products, h) {
       ? "order"
       : "general";
 
-  /* ===== PRODUCT ===== */
+  /* PRODUCT MATCH */
   let product = findProduct(products, msg);
 
   const context =
     /\b(ki|eta|this|it)\b/.test(msg) &&
     /(price|color|stock|available)/.test(msg);
 
-  if (!product && context && h?.lastProduct) {
-    product = h.lastProduct;
-  }
+  if (!product && context) product = h.lastProduct;
 
   if (!product) {
-    if (!products.length) return "⚠️ Products loading...";
-
     const list = products
       .slice(0, 5)
-      .map((p) => `• ${p?.product_name}`)
+      .map((p) => `• ${p.product_name}`)
       .join("\n");
 
-    return `❌ Product not found\n\nAvailable:\n${list}`;
+    return `❌ Product not available\n\nAvailable:\n${list}`;
   }
 
   h.lastProduct = product;
 
-  const name = product.product_name || "Product";
-  const price = product.price_bdt ?? "N/A";
-  const color = product.color ?? "N/A";
+  const name = product.product_name;
+  const price = product.price_bdt || "N/A";
+  const color = product.color || "N/A";
 
-  /* ===== RESPONSES ===== */
+  /* RESPONSES */
   if (intent === "price") return `${name} price ${price} BDT`;
   if (intent === "color") return `${name} color ${color}`;
 
   if (intent === "stock") {
     return product.stock_availability === "in_stock"
       ? `${name} available`
-      : `${name} not available`;
+      : `❌ Not available`;
   }
 
-  /* ===== ORDER → ONLY ALERT (NO CONFIRM MESSAGE) ===== */
+  /* ORDER → ONLY ALERT (NO CONFIRM MESSAGE) */
   if (intent === "order") {
     try {
       await axios.post(ALERT_URL, {
@@ -140,11 +137,12 @@ async function ai(sender, msg, products, h) {
         product_name: name,
         price,
         color,
+        status: "PENDING",
         time: Date.now(),
       });
     } catch {}
 
-    return "🛒 Your order request sent to seller. Please wait for confirmation.";
+    return "🛒 Order request sent to seller. Seller will confirm soon.";
   }
 
   return `${name} - ${price} BDT`;
