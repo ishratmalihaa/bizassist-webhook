@@ -4,6 +4,8 @@ const axios = require("axios");
 const app = express();
 app.use(express.json());
 
+/* ================= CONFIG ================= */
+
 const BASE =
   "https://project--b95f1c78-6680-4b45-b2e2-e1d1fbebf00d.lovable.app";
 
@@ -17,7 +19,7 @@ const seen = new Map();
 const history = new Map();
 
 /* ================= UTIL ================= */
-const clean = (t) => (t || "").toString().toLowerCase().trim();
+const clean = (t) => (t || "").toLowerCase().trim();
 
 /* ================= GET PRODUCTS ================= */
 async function getProducts() {
@@ -28,19 +30,19 @@ async function getProducts() {
     if (Array.isArray(res.data)) return res.data;
 
     return [];
-  } catch (e) {
+  } catch {
     return [];
   }
 }
 
-/* ================= PRODUCT MATCH ================= */
+/* ================= FIND PRODUCT ================= */
 function findProduct(products, msg) {
   msg = clean(msg);
 
   let best = null;
   let score = 0;
 
-  for (const p of products || []) {
+  for (const p of products) {
     if (!p?.product_name) continue;
 
     const name = clean(p.product_name);
@@ -71,7 +73,7 @@ async function ai(sender, msg, products, h) {
 
   if (!Array.isArray(products)) products = [];
 
-  /* ================= GREETING ================= */
+  /* ===== GREETING ===== */
   if (/^(hi|hello|hey|halo|helo)$/i.test(msg)) {
     return "👋 Hello! What are you looking for?";
   }
@@ -80,7 +82,7 @@ async function ai(sender, msg, products, h) {
     return "👋 আসসালামু আলাইকুম! আপনি কী খুঁজছেন?";
   }
 
-  /* ================= INTENT ================= */
+  /* ===== INTENT ===== */
   const intent =
     /price|dam|koto/.test(msg)
       ? "price"
@@ -92,7 +94,7 @@ async function ai(sender, msg, products, h) {
       ? "order"
       : "general";
 
-  /* ================= PRODUCT ================= */
+  /* ===== PRODUCT ===== */
   let product = findProduct(products, msg);
 
   const context =
@@ -103,38 +105,34 @@ async function ai(sender, msg, products, h) {
     product = h.lastProduct;
   }
 
-  /* ================= NO PRODUCT ================= */
   if (!product) {
-    if (!products.length) {
-      return "⚠️ Product system loading...";
-    }
+    if (!products.length) return "⚠️ Products loading...";
 
     const list = products
       .slice(0, 5)
-      .map((p) => `• ${p?.product_name || "Unknown"}`)
+      .map((p) => `• ${p?.product_name}`)
       .join("\n");
 
     return `❌ Product not found\n\nAvailable:\n${list}`;
   }
 
-  /* ================= SAVE CONTEXT ================= */
   h.lastProduct = product;
 
   const name = product.product_name || "Product";
   const price = product.price_bdt ?? "N/A";
   const color = product.color ?? "N/A";
 
-  /* ================= RESPONSES ================= */
-  if (intent === "price") return `${name} price is ${price} BDT`;
-  if (intent === "color") return `${name} color is ${color}`;
+  /* ===== RESPONSES ===== */
+  if (intent === "price") return `${name} price ${price} BDT`;
+  if (intent === "color") return `${name} color ${color}`;
 
   if (intent === "stock") {
     return product.stock_availability === "in_stock"
-      ? `${name} is available`
-      : `❌ Not available`;
+      ? `${name} available`
+      : `${name} not available`;
   }
 
-  /* ================= ORDER (ONLY ALERT TO SELLER) ================= */
+  /* ===== ORDER → ONLY ALERT (NO CONFIRM MESSAGE) ===== */
   if (intent === "order") {
     try {
       await axios.post(ALERT_URL, {
@@ -142,14 +140,11 @@ async function ai(sender, msg, products, h) {
         product_name: name,
         price,
         color,
-        status: "pending",
         time: Date.now(),
       });
-    } catch (e) {
-      console.log("alert error");
-    }
+    } catch {}
 
-    return `🟡 Order request sent to seller. Waiting for confirmation.`;
+    return "🛒 Your order request sent to seller. Please wait for confirmation.";
   }
 
   return `${name} - ${price} BDT`;
@@ -176,9 +171,7 @@ app.post("/webhook", async (req, res) => {
 
       const h =
         history.get(sender) ||
-        history.set(sender, {
-          lastProduct: null,
-        }).get(sender);
+        history.set(sender, { lastProduct: null }).get(sender);
 
       const reply = await ai(sender, msg, products, h);
 
@@ -207,6 +200,8 @@ app.get("/webhook", (req, res) => {
 });
 
 /* ================= START ================= */
-app.listen(process.env.PORT || 3000, () => {
-  console.log("🚀 BOT RUNNING");
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, () => {
+  console.log("🚀 BOT RUNNING ON", PORT);
 });
