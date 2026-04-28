@@ -21,7 +21,6 @@ const ALERT_URL = `${BASE_URL}/api/public/order-alert`;
 const processedMessages = new Map();
 const MESSAGE_TTL = 60000;
 
-/* cleanup */
 setInterval(() => {
   const now = Date.now();
   for (const [mid, time] of processedMessages.entries()) {
@@ -42,30 +41,43 @@ function getHistory(id) {
   return historyMap.get(id);
 }
 
-/* ================= CACHE ================= */
+/* ================= PRODUCT CACHE ================= */
 let productCache = { data: [], time: 0 };
 const CACHE_TIME = 15000;
 
+/* ================= PRODUCTS (FIXED SAFE) ================= */
 async function getProducts() {
   const now = Date.now();
 
   if (now - productCache.time < CACHE_TIME) {
-    return productCache.data;
+    return Array.isArray(productCache.data) ? productCache.data : [];
   }
 
   try {
-    const res = await axios.get(`${PRODUCTS_URL}?seller_id=${SELLER_ID}`, {
-      timeout: 8000,
-      headers: { "x-api-key": WEBHOOK_API_KEY },
-    });
+    const res = await axios.get(
+      `${PRODUCTS_URL}?seller_id=${SELLER_ID}`,
+      {
+        timeout: 8000,
+        headers: { "x-api-key": WEBHOOK_API_KEY },
+      }
+    );
 
-    const data = res.data?.data || res.data || [];
+    let data = res.data;
+
+    if (Array.isArray(data)) {
+      data = data;
+    } else if (Array.isArray(data?.data)) {
+      data = data.data;
+    } else {
+      data = [];
+    }
 
     productCache = { data, time: now };
+
     return data;
   } catch (err) {
     console.error("PRODUCT ERROR:", err.message);
-    return productCache.data || [];
+    return Array.isArray(productCache.data) ? productCache.data : [];
   }
 }
 
@@ -82,8 +94,10 @@ function detectIntent(msg = "") {
   return "general";
 }
 
-/* ================= PRODUCT MATCH (FIXED SAFE) ================= */
+/* ================= PRODUCT MATCH (SAFE) ================= */
 function findProduct(products = [], msg = "") {
+  if (!Array.isArray(products)) return null;
+
   msg = (msg || "").toLowerCase();
 
   let best = null;
@@ -92,8 +106,7 @@ function findProduct(products = [], msg = "") {
   for (const p of products) {
     if (!p?.product_name) continue;
 
-    const name = (p.product_name || "").toLowerCase();
-    if (!name) continue;
+    const name = p.product_name.toLowerCase();
 
     if (msg.includes(name)) return p;
 
@@ -111,7 +124,7 @@ function findProduct(products = [], msg = "") {
   return score >= 0.4 ? best : null;
 }
 
-/* ================= ALERT SAFE ================= */
+/* ================= ALERT ================= */
 async function sendAlert(senderId, product) {
   if (!product?.product_name) return;
 
@@ -127,8 +140,8 @@ async function sendAlert(senderId, product) {
   }
 }
 
-/* ================= FACEBOOK SEND (SAFE + RETRY) ================= */
-async function sendMessage(sender, text, retry = 0) {
+/* ================= FACEBOOK SEND (SAFE) ================= */
+async function sendMessage(sender, text) {
   try {
     await axios.post(
       `https://graph.facebook.com/v18.0/me/messages`,
@@ -142,11 +155,7 @@ async function sendMessage(sender, text, retry = 0) {
       }
     );
   } catch (err) {
-    if (retry < 2) {
-      await new Promise(r => setTimeout(r, 1000));
-      return sendMessage(sender, text, retry + 1);
-    }
-    console.error("FB ERROR:", err.message);
+    console.error("FB ERROR:", err.response?.data || err.message);
   }
 }
 
@@ -156,7 +165,6 @@ async function ai(senderId, msg, products, history) {
 
   const intent = detectIntent(msg);
 
-  /* STOP WORDS */
   if (msg.includes("stop") || msg.includes("dont show")) {
     return "👍 ঠিক আছে, বলুন কী জানতে চান।";
   }
@@ -228,7 +236,7 @@ app.post("/webhook", async (req, res) => {
         const msg = event.message?.text || "";
         const mid = event.message?.mid;
 
-        if (!mid || typeof mid !== "string") continue;
+        if (!mid) continue;
 
         if (processedMessages.has(mid)) continue;
         processedMessages.set(mid, Date.now());
