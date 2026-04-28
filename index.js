@@ -2,12 +2,14 @@ const express = require("express");
 const axios = require("axios");
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
 
-/* ================= SAFE CONFIG ================= */
-const VERIFY_TOKEN = (process.env && process.env.VERIFY_TOKEN) || "bizassist123";
-const PAGE_ACCESS_TOKEN = (process.env && process.env.PAGE_ACCESS_TOKEN) || "";
-const WEBHOOK_API_KEY = (process.env && process.env.WEBHOOK_API_KEY) || "";
+/* ================= ENV SAFETY ================= */
+const env = process.env || {};
+
+const VERIFY_TOKEN = env.VERIFY_TOKEN || "bizassist123";
+const PAGE_ACCESS_TOKEN = env.PAGE_ACCESS_TOKEN || "";
+const WEBHOOK_API_KEY = env.WEBHOOK_API_KEY || "";
 
 const SELLER_ID = "67f55dc2-41e9-410c-8c6b-289ebee08118";
 
@@ -15,32 +17,42 @@ const BASE =
   "https://project--b95f1c78-6680-4b45-b2e2-e1d1fbebf00d.lovable.app";
 
 const PRODUCTS_URL = `${BASE}/api/public/get-products`;
-const ALERT_URL = `${BASE}/api/public/order-alert`;
 
-/* ================= HEALTH CHECK ================= */
-app.get("/", (req, res) => {
-  res.send("✅ BizAssist Running");
-});
+/* ================= SAFETY CHECK ================= */
+if (!PAGE_ACCESS_TOKEN) {
+  console.warn("⚠️ PAGE_ACCESS_TOKEN missing (messages will not send)");
+}
 
 /* ================= MEMORY ================= */
 const seen = new Map();
-const history = new Map();
+const historyMap = new Map();
 
-/* cleanup */
+/* ================= CACHE ================= */
+let cache = { data: [], time: 0 };
+
+/* ================= CLEANUP (PREVENT MEMORY LEAK) ================= */
 setInterval(() => {
   const now = Date.now();
-  for (const [k, v] of seen.entries()) {
-    if (now - v > 60000) seen.delete(k);
+
+  for (const [mid, time] of seen.entries()) {
+    if (now - time > 60 * 1000) seen.delete(mid);
+  }
+
+  for (const [id, data] of historyMap.entries()) {
+    if (data?.lastSeen && now - data.lastSeen > 24 * 60 * 60 * 1000) {
+      historyMap.delete(id);
+    }
   }
 }, 30000);
 
-/* ================= PRODUCT CACHE ================= */
-let cache = { data: [], time: 0 };
+/* ================= SAFE UTIL ================= */
+const safeLower = (v) => (v || "").toString().toLowerCase().trim();
 
+/* ================= GET PRODUCTS ================= */
 async function getProducts() {
   const now = Date.now();
 
-  if (now - cache.time < 20000 && cache.data.length > 0) {
+  if (Array.isArray(cache.data) && now - cache.time < 20000) {
     return cache.data;
   }
 
@@ -60,35 +72,42 @@ async function getProducts() {
     else if (Array.isArray(raw?.data)) data = raw.data;
     else if (Array.isArray(raw?.products)) data = raw.products;
 
-    cache = { data, time: now };
+    cache = {
+      data: Array.isArray(data) ? data : [],
+      time: now,
+    };
 
-    return data;
+    return cache.data;
   } catch (err) {
     console.error("PRODUCT ERROR:", err.message);
-    return cache.data || [];
+    return Array.isArray(cache.data) ? cache.data : [];
   }
 }
 
 /* ================= HISTORY ================= */
 function getHistory(id) {
-  if (!history.has(id)) {
-    history.set(id, {
+  if (!historyMap.has(id)) {
+    historyMap.set(id, {
       lastProduct: null,
       awaitingOrder: false,
       orderProduct: null,
+      lastSeen: Date.now(),
     });
   }
-  return history.get(id);
+
+  const h = historyMap.get(id);
+  h.lastSeen = Date.now();
+  return h;
 }
 
 /* ================= INTENT ================= */
 function getIntent(msg = "") {
-  msg = msg.toLowerCase();
+  msg = safeLower(msg);
 
-  if (msg.includes("price") || msg.includes("dam")) return "price";
-  if (msg.includes("color") || msg.includes("rong")) return "color";
-  if (msg.includes("stock") || msg.includes("available")) return "stock";
-  if (msg.includes("order") || msg.includes("buy")) return "order";
+  if (/price|dam|koto/.test(msg)) return "price";
+  if (/color|rong/.test(msg)) return "color";
+  if (/stock|available|ache/.test(msg)) return "stock";
+  if (/order|buy|nibo/.test(msg)) return "order";
 
   return "general";
 }
@@ -96,7 +115,8 @@ function getIntent(msg = "") {
 /* ================= PRODUCT MATCH ================= */
 function findProduct(products, msg = "") {
   if (!Array.isArray(products)) return null;
-  msg = msg.toLowerCase();
+
+  msg = safeLower(msg);
 
   let best = null;
   let score = 0;
@@ -104,12 +124,12 @@ function findProduct(products, msg = "") {
   for (const p of products) {
     if (!p?.product_name) continue;
 
-    const name = p.product_name.toLowerCase();
+    const name = safeLower(p.product_name);
 
     if (msg.includes(name)) return p;
 
-    const words = name.split(" ");
-    const match = words.filter((w) => msg.includes(w)).length;
+    const words = name.split(" ").filter(Boolean);
+    const match = words.filter(w => msg.includes(w)).length;
 
     const s = words.length ? match / words.length : 0;
 
@@ -122,8 +142,10 @@ function findProduct(products, msg = "") {
   return score >= 0.4 ? best : null;
 }
 
-/* ================= FACEBOOK SEND ================= */
-async function sendMessage(sender, text, retry = 1) {
+/* ================= SEND MESSAGE ================= */
+async function sendMessage(sender, text) {
+  if (!PAGE_ACCESS_TOKEN) return;
+
   try {
     await axios.post(
       "https://graph.facebook.com/v18.0/me/messages",
@@ -132,93 +154,84 @@ async function sendMessage(sender, text, retry = 1) {
         message: { text },
       },
       {
-        params: {
-          access_token: PAGE_ACCESS_TOKEN,
-        },
+        params: { access_token: PAGE_ACCESS_TOKEN },
         timeout: 8000,
       }
     );
   } catch (err) {
-    console.error("FB ERROR:", err.message);
-
-    if (retry > 0) {
-      await new Promise((r) => setTimeout(r, 1000));
-      return sendMessage(sender, text, retry - 1);
-    }
+    console.error("FB ERROR:", err.response?.data || err.message);
   }
 }
 
-/* ================= ALERT ================= */
-async function sendAlert(sender, product) {
-  try {
-    await axios.post(ALERT_URL, {
-      secret: WEBHOOK_API_KEY,
-      seller_id: SELLER_ID,
-      customer_fb_id: sender,
-      product_name: product?.product_name || "unknown",
-    });
-  } catch (err) {
-    console.error("ALERT ERROR:", err.message);
-  }
-}
-
-/* ================= AI ================= */
+/* ================= AI ENGINE ================= */
 async function ai(sender, msg, products, h) {
-  msg = (msg || "").toLowerCase();
-
+  msg = safeLower(msg);
   const intent = getIntent(msg);
 
-  /* order confirm */
+  if (msg.includes("stop")) return "ঠিক আছে 👍";
+
+  /* ORDER FLOW */
   if (h.awaitingOrder) {
-    if (msg.includes("yes")) {
+    if (/^(yes|haan|ok|sure|nibo)$/i.test(msg)) {
       const p = h.orderProduct;
+
       h.awaitingOrder = false;
       h.orderProduct = null;
 
-      if (!p) return "Product missing";
-
-      await sendAlert(sender, p);
+      if (!p) return "⚠️ Product missing";
 
       return `🛒 Order confirmed: ${p.product_name}`;
     }
 
-    if (msg.includes("no")) {
+    if (/^(no|cancel|na)$/i.test(msg)) {
       h.awaitingOrder = false;
       h.orderProduct = null;
       return "❌ Cancelled";
     }
   }
 
-  const product = findProduct(products, msg);
+  /* PRODUCT FIND */
+  let product = findProduct(products, msg);
+
+  const isContext =
+    /\b(ki|ache|eta|this|it)\b/.test(msg) &&
+    /(color|rong|price|dam|stock|available)/.test(msg);
+
+  if (!product && isContext) {
+    product = h.lastProduct;
+  }
 
   if (!product) {
-    return intent === "order"
-      ? "কোন product চান?"
-      : "Product পাওয়া যায়নি 🙂";
+    const list = (products || [])
+      .slice(0, 5)
+      .map(p => `• ${p.product_name}`)
+      .join("\n");
+
+    return `Product পাওয়া যায়নি 😕\n\nAvailable:\n${list}`;
+  }
+
+  h.lastProduct = product;
+
+  const name = product.product_name;
+  const price = product.price_bdt || "N/A";
+  const color = product.color || "N/A";
+
+  if (intent === "price") return `${name} price ${price} BDT`;
+  if (intent === "color") return `${name} color: ${color}`;
+
+  if (intent === "stock") {
+    return product.stock_availability === "in_stock"
+      ? `${name} available`
+      : `${name} out of stock`;
   }
 
   if (intent === "order") {
     h.awaitingOrder = true;
     h.orderProduct = product;
-
-    return `Confirm order for ${product.product_name}? (yes/no)`;
+    return `Do you want to order ${name}? (yes/no)`;
   }
 
-  if (intent === "price") {
-    return `${product.product_name} price ${product.price_bdt || "N/A"} BDT`;
-  }
-
-  if (intent === "color") {
-    return `${product.product_name} color ${product.color || "N/A"}`;
-  }
-
-  if (intent === "stock") {
-    return product.stock_availability === "in_stock"
-      ? "Available"
-      : "Out of stock";
-  }
-
-  return `${product.product_name} - ${product.price_bdt || "N/A"} BDT`;
+  return `${name} - ${price} BDT`;
 }
 
 /* ================= WEBHOOK ================= */
@@ -261,9 +274,8 @@ app.get("/webhook", (req, res) => {
 });
 
 /* ================= START ================= */
-const PORT = process.env.PORT || 3000;
+const PORT = env.PORT || 3000;
 
 app.listen(PORT, () => {
-  console.log("🚀 BizAssist FIXED RUNNING on", PORT);
-  console.log("VERIFY TOKEN SET:", !!process.env.VERIFY_TOKEN);
+  console.log("🚀 BizAssist PRODUCTION READY RUNNING on", PORT);
 });
