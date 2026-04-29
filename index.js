@@ -2,337 +2,471 @@ const express = require("express");
 const axios = require("axios");
 const Groq = require("groq-sdk");
 
+/* ------------------- CONFIG ------------------- */
 const app = express();
 app.use(express.json());
 
-/* ===== CONFIG ===== */
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "bizassist123";
-const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
-const WEBHOOK_API_KEY = process.env.WEBHOOK_API_KEY;
-const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN || "";
+const WEBHOOK_API_KEY = process.env.WEBHOOK_API_KEY || "";
+const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
+
+if (!PAGE_ACCESS_TOKEN) {
+  console.error("❌ Missing PAGE_ACCESS_TOKEN. Set it in Render env vars.");
+  process.exit(1);
+}
+if (!WEBHOOK_API_KEY) {
+  console.error("❌ Missing WEBHOOK_API_KEY. Set it in Render env vars.");
+  process.exit(1);
+}
+if (!GROQ_API_KEY) {
+  console.warn("⚠️ Missing GROQ_API_KEY – AI fallback and image analysis disabled.");
+}
 
 const SELLER_ID = "67f55dc2-41e9-410c-8c6b-289ebee08118";
-const BASE = "https://project--b95f1c78-6680-4b45-b2e2-e1d1fbebf00d.lovable.app";
-const PRODUCTS_URL = `${BASE}/api/public/get-products`;
-const ALERT_URL = `${BASE}/api/public/order-alert`;
+const BASE_URL =
+  "https://project--b95f1c78-6680-4b45-b2e2-e1d1fbebf00d.lovable.app";
+const PRODUCTS_URL = `${BASE_URL}/api/public/get-products`;
+const ALERT_URL = `${BASE_URL}/api/public/order-alert`;
 
-if (!PAGE_ACCESS_TOKEN) console.error("❌ PAGE_ACCESS_TOKEN missing!");
-if (!WEBHOOK_API_KEY) console.error("❌ WEBHOOK_API_KEY missing!");
+const groq = GROQ_API_KEY ? new Groq({ apiKey: GROQ_API_KEY }) : null;
 
-/* ===== MEMORY ===== */
-const seen = new Map();
-const historyMap = new Map();
-const cooldown = new Map();
+/* ------------------- MEMORY & CLEANUP ------------------- */
+const processedMessages = new Map();
+const userCooldown = new Map();
+const userSessions = new Map();
+
+const MESSAGE_TTL = 60000;
+const COOLDOWN_MS = 800;
 
 setInterval(() => {
   const now = Date.now();
-  for (const [k, t] of seen) if (now - t > 60000) seen.delete(k);
-  for (const [k, t] of cooldown) if (now - t > 60000) cooldown.delete(k);
-  for (const [k, v] of historyMap) if (now - (v._t || 0) > 3600000) historyMap.delete(k);
-}, 60000);
+  for (const [id, time] of processedMessages.entries()) {
+    if (now - time > MESSAGE_TTL) processedMessages.delete(id);
+  }
+  for (const [id, time] of userCooldown.entries()) {
+    if (now - time > MESSAGE_TTL) userCooldown.delete(id);
+  }
+  for (const [id, session] of userSessions.entries()) {
+    if (now - (session.lastActive || 0) > 3600000) userSessions.delete(id);
+  }
+}, 30000);
 
-// FIX 6: spam filter 800ms
-function isSpam(id) {
-  const now = Date.now();
-  const last = cooldown.get(id) || 0;
-  if (now - last < 800) return true;
-  cooldown.set(id, now);
-  return false;
+/* ------------------- SESSION MANAGER ------------------- */
+function getSession(senderId) {
+  if (!userSessions.has(senderId)) {
+    userSessions.set(senderId, {
+      lastProduct: null,
+      lastIntent: null,
+      collectingDetails: false,   // waiting for name/address/phone after order request
+      pendingOrderProduct: null,
+      lang: "en",
+      lastActive: Date.now(),
+    });
+  }
+  const sess = userSessions.get(senderId);
+  sess.lastActive = Date.now();
+  return sess;
 }
 
-/* ===== PRODUCT CACHE ===== */
-let cache = { data: [], time: 0 };
+/* ------------------- PRODUCT SERVICE (cached + concurrency lock) ------------------- */
+let productCache = { data: [], time: 0 };
+let fetchingProducts = null;
+const CACHE_TTL = 20000;
 
-async function getProducts() {
-  const now = Date.now();
-  if (cache.data.length && now - cache.time < 20000) return cache.data;
+async function fetchProducts() {
+  if (fetchingProducts) return fetchingProducts;
 
-  try {
-    const res = await axios.get(`${PRODUCTS_URL}?seller_id=${SELLER_ID}`, {
-      headers: { "x-api-key": WEBHOOK_API_KEY },
-      timeout: 8000,
-    });
-
-    const raw = res.data;
-    let data = [];
-    if (Array.isArray(raw)) data = raw;
-    else if (Array.isArray(raw?.products)) data = raw.products;
-    else if (Array.isArray(raw?.data)) data = raw.data;
-    else if (raw && typeof raw === "object") {
-      for (const val of Object.values(raw)) {
-        if (Array.isArray(val) && val.length > 0) { data = val; break; }
-      }
+  fetchingProducts = (async () => {
+    const now = Date.now();
+    if (now - productCache.time < CACHE_TTL && productCache.data.length) {
+      return productCache.data;
     }
 
-    // FIX 2: সবসময় cache update করো
-    cache = { data, time: now };
-    console.log("✅ Products loaded:", data.length);
-    return data;
+    try {
+      const res = await axios.get(`${PRODUCTS_URL}?seller_id=${SELLER_ID}`, {
+        headers: { "x-api-key": WEBHOOK_API_KEY },
+        timeout: 8000,
+      });
+      let data = [];
+      if (Array.isArray(res.data)) data = res.data;
+      else if (Array.isArray(res.data?.data)) data = res.data.data;
+      else if (Array.isArray(res.data?.products)) data = res.data.products;
 
-  } catch (err) {
-    console.error("❌ Product fetch:", err.message);
-    return cache.data.length ? cache.data : [];
+      if (data.length) {
+        productCache = { data, time: now };
+      } else if (!productCache.data.length) {
+        console.error("❌ No product data from API and cache is empty.");
+      }
+      return data;
+    } catch (err) {
+      console.error("Product fetch error:", err.message);
+      return productCache.data;
+    } finally {
+      fetchingProducts = null;
+    }
+  })();
+
+  return fetchingProducts;
+}
+
+function findBestProduct(products, query) {
+  if (!products.length || !query) return null;
+  const q = query.toLowerCase();
+  let best = null;
+  let bestScore = 0;
+
+  for (const p of products) {
+    const name = (p.product_name || "").toLowerCase();
+    if (!name) continue;
+
+    if (q.includes(name) || name.includes(q)) return p;
+
+    const nameWords = name.split(/\s+/).filter(w => w.length > 1);
+    const queryWords = q.split(/\s+/).filter(w => w.length > 1);
+    let matchCount = 0;
+    for (const nw of nameWords) {
+      if (queryWords.some(qw => qw.includes(nw) || nw.includes(qw))) matchCount++;
+    }
+    const score = nameWords.length ? matchCount / nameWords.length : 0;
+    if (score > bestScore) {
+      bestScore = score;
+      best = p;
+    }
   }
+  return bestScore >= 0.35 ? best : null;
 }
 
-/* ===== HISTORY ===== */
-function getHistory(id) {
-  if (!historyMap.has(id)) {
-    historyMap.set(id, { lastProduct: null, lang: null, _t: Date.now() });
-  }
-  const h = historyMap.get(id);
-  h._t = Date.now();
-  return h;
+/* ------------------- INTENT SERVICE ------------------- */
+function detectIntent(text) {
+  const t = text.toLowerCase();
+  let scores = { price: 0, stock: 0, color: 0, order: 0, greeting: 0 };
+
+  if (/(price|dam|koto|দাম|কত)/i.test(t)) scores.price += 3;
+  if (/(stock|ache|available|আছে|ase|in stock|do you have)/i.test(t)) scores.stock += 3;
+  if (/(color|colour|rong|রং)/i.test(t)) scores.color += 3;
+  if (/(order|buy|purchase|nibo|নেব|kinbo|কিনব|lagbe|লাগবে|i want|i need)/i.test(t))
+    scores.order += 3;
+  if (/^(hi|hello|hey|হ্যালো|হাই|assalamualaikum|salam)$/i.test(t))
+    scores.greeting += 2;
+
+  const top = Object.entries(scores).sort((a, b) => b[1] - a[1])[0];
+  return top[1] > 0 ? top[0] : "fallback";
 }
 
-/* ===== LANGUAGE ===== */
-function getLang(msg = "") {
-  if (/[\u0980-\u09FF]/.test(msg)) return "bn";
-  if (/\b(koto|dam|ache|nai|ki|taka|nibo|rong|lagbe|ase|chai|korbo|boro|valo)\b/i.test(msg)) return "bl";
-  return "en";
-}
-
-function fmt(lang, bn, bl, en) {
+/* ------------------- MULTI‑LANGUAGE ------------------- */
+function replyInLanguage(lang, bn, bl, en) {
   if (lang === "bn") return bn;
   if (lang === "bl") return bl;
   return en;
 }
 
-/* ===== FUZZY MATCH ===== */
-function findProduct(products, msg = "") {
-  if (!Array.isArray(products) || !msg) return null;
-  const m = msg.toLowerCase();
-
-  // exact match আগে
-  for (const p of products) {
-    if (!p?.product_name) continue;
-    if (m.includes(p.product_name.toLowerCase())) return p;
-  }
-
-  // FIX 3: threshold 0.3
-  let best = null, bestScore = 0;
-  for (const p of products) {
-    if (!p?.product_name) continue;
-    const words = p.product_name.toLowerCase().split(" ").filter(Boolean);
-    const matched = words.filter(w => w.length > 2 && m.includes(w)).length;
-    const score = words.length ? matched / words.length : 0;
-    if (score > bestScore) { bestScore = score; best = p; }
-  }
-  return bestScore >= 0.3 ? best : null;
+function detectLanguage(text) {
+  if (/[\u0980-\u09FF]/.test(text)) return "bn";
+  if (/(koto|dam|ache|nai|ki|taka|nibo|rong|lagbe|ase)/i.test(text)) return "bl";
+  return "en";
 }
 
-/* ===== INTENT ===== */
-function getIntent(msg = "") {
-  const m = msg.toLowerCase();
-  if (/price|dam|koto|দাম|কত/.test(m)) return "price";
-  if (/color|colour|rong|রং/.test(m)) return "color";
-  if (/koyta|koyti|quantity|কয়টা/.test(m)) return "quantity";
-  if (/stock|ache|available|আছে|ase/.test(m)) return "stock";
-  if (/order|buy|nibo|নেব|korbo|kinte|lagbe/.test(m)) return "order";
-  return "general";
-}
+/* ------------------- AI FALLBACK (safe, no hallucination) ------------------- */
+async function getAIHelp(userMessage, session) {
+  if (!groq) return "I'm having trouble thinking. Please try again.";
 
-/* ===== BUILD REPLY ===== */
-function buildReply(lang, p, intent) {
-  const name = p.product_name;
-  const price = p.price_bdt || "N/A";
-  const color = p.color || "N/A";
-  const inStock = p.stock_availability === "in_stock";
-  const qty = p.stock_count || p.quantity || null;
+  try {
+    const chat = await groq.chat.completions.create({
+      model: "llama-3.3-70b-versatile",
+      temperature: 0.3,
+      messages: [
+        {
+          role: "system",
+          content: `You are BizAssist, a friendly and helpful shop assistant for an online store.
 
-  if (intent === "price") return fmt(lang,
-    `${name} এর দাম ${price} টাকা।`,
-    `${name} er dam ${price} taka.`,
-    `${name} price is ${price} BDT.`
-  );
-  if (intent === "color") return fmt(lang,
-    `${name} এর রং: ${color}`,
-    `${name} er color: ${color}`,
-    `${name} colors: ${color}`
-  );
-  if (intent === "quantity") return qty
-    ? fmt(lang,
-        `${name} এখন ${qty}টা আছে।`,
-        `${name} ekhon ${qty}ta ache.`,
-        `${name} has ${qty} in stock.`
-      )
-    : fmt(lang,
-        inStock ? `${name} আছে। পরিমাণ জানতে seller কে জিজ্ঞেস করুন।` : `${name} নেই।`,
-        inStock ? `${name} ache. Porimaan jante seller ke jiggesh korun.` : `${name} nai.`,
-        inStock ? `${name} in stock. Ask seller for quantity.` : `${name} out of stock.`
+RULES:
+- NEVER invent products, prices, colors, or stock. If you don't know, say "I'm not sure, please check our product list."
+- Keep replies SHORT, one sentence max.
+- Match the user's language (English, Bangla, or Banglish).
+- Be pleasant and slightly persuasive like a real shop assistant.
+
+Conversation context:
+Last product asked: ${session.lastProduct?.product_name || "none"}
+Last intent: ${session.lastIntent || "none"}
+User message: ${userMessage}
+
+Now reply naturally, but do NOT invent product details.`,
+        },
+      ],
+      max_tokens: 150,
+    });
+    let reply = chat.choices[0].message.content.trim();
+
+    const products = await fetchProducts();
+    const mentionsReal = products.some(p =>
+      reply.toLowerCase().includes(p.product_name.toLowerCase())
+    );
+    if (!mentionsReal && reply.toLowerCase().match(/(?:price|cost|stock|available|have|in stock)/)) {
+      return replyInLanguage(session.lang,
+        "আমি নিশ্চিত নই। দয়া করে প্রোডাক্টের নাম স্পষ্ট করে বলুন।",
+        "Ami nishchit noi. Please product er naam shpôshto kore bolun.",
+        "I'm not sure. Please tell me the exact product name."
       );
-  if (intent === "stock") return fmt(lang,
-    inStock ? `${name} এখন available।` : `${name} এখন নেই।`,
-    inStock ? `${name} ache.` : `${name} nai.`,
-    inStock ? `${name} is in stock.` : `${name} is out of stock.`
-  );
-  return fmt(lang,
-    `${name} — দাম ${price} টাকা, রং: ${color}${inStock ? ", আছে।" : ", নেই।"}`,
-    `${name} — dam ${price} taka, color: ${color}${inStock ? ", ache." : ", nai."}`,
-    `${name} — ${price} BDT, ${color}${inStock ? ", in stock." : ", out of stock."}`
-  );
+    }
+    return reply;
+  } catch (err) {
+    console.error("AI fallback error:", err.message);
+    return replyInLanguage(session.lang,
+      "একটু পরে আবার চেষ্টা করুন।",
+      "Ektu pore abar chesta korun.",
+      "Please try again in a moment."
+    );
+  }
 }
 
-/* ===== PRODUCT LIST ===== */
-function productList(products, lang) {
-  if (!products.length) return fmt(lang,
-    "কোনো product নেই।",
-    "Kono product nai.",
-    "No products available."
-  );
-  const list = products.map(p => `• ${p.product_name}`).join("\n");
-  return fmt(lang,
-    `আমাদের products:\n${list}\n\nকোনটার কথা জানতে চান?`,
-    `Amader products:\n${list}\n\nKontar kotha jante chan?`,
-    `Our products:\n${list}\n\nWhich one would you like to know about?`
-  );
+/* ------------------- IMAGE ANALYSIS ------------------- */
+async function analyzeImage(imageUrl, products) {
+  const urlLower = imageUrl.toLowerCase();
+  const fastMatch = findBestProduct(products, urlLower);
+  if (fastMatch) {
+    return {
+      found: true,
+      product: fastMatch,
+      reply: `${fastMatch.product_name} — Price: ${fastMatch.price_bdt || "N/A"} BDT.`,
+    };
+  }
+
+  if (!groq) return { found: false, reply: null };
+
+  try {
+    const img = await axios.get(imageUrl, { responseType: "arraybuffer", timeout: 8000 });
+    const base64 = Buffer.from(img.data).toString("base64");
+    const productList = products.map(p => `- ${p.product_name} (${p.price_bdt || "N/A"} BDT)`).join("\n");
+
+    const vision = await groq.chat.completions.create({
+      model: "llama-3.2-11b-vision-preview",
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "image_url",
+              image_url: { url: `data:image/jpeg;base64,${base64}` },
+            },
+            {
+              type: "text",
+              text: `You are a product matcher. Our products:\n${productList}\n\nDoes the image match any product exactly? If yes, reply with ONLY the product name (nothing else). If no, reply with "NOT_IN_SHOP". Do not invent.`,
+            },
+          ],
+        },
+      ],
+      max_tokens: 50,
+    });
+    const answer = vision.choices[0].message.content.trim();
+    if (answer !== "NOT_IN_SHOP") {
+      const matched = findBestProduct(products, answer);
+      if (matched) return { found: true, product: matched, reply: `${matched.product_name} — ${matched.price_bdt || "N/A"} BDT` };
+    }
+    return { found: false, reply: null };
+  } catch (err) {
+    console.error("Image AI error:", err.message);
+    return { found: false, reply: null };
+  }
 }
 
-/* ===== ORDER ALERT ===== */
-async function sendAlert(senderId, product, msg) {
-  // FIX 8: getFBName skip — faster
+/* ------------------- ORDER ALERT (PENDING CONFIRMATION) ------------------- */
+async function sendOrderAlert(senderId, product, detailsText) {
   try {
     await axios.post(ALERT_URL, {
       secret: WEBHOOK_API_KEY,
       seller_id: SELLER_ID,
       customer_fb_id: senderId,
-      product_name: product?.product_name || "Unknown",
-      message: msg,
-    }, { timeout: 5000 });
-    console.log("✅ Alert sent:", product?.product_name);
+      product_name: product.product_name,
+      message: `🧾 NEW ORDER REQUEST (PENDING CONFIRMATION)\n\nProduct: ${product.product_name}\n\nCustomer Details:\n${detailsText}\n\n⚠️ Seller must confirm this order before processing.`,
+    });
+    console.log(`✅ Order request sent for confirmation: ${product.product_name}`);
   } catch (err) {
-    // FIX 7: response data log করো
-    console.error("❌ Alert error:", err.response?.data || err.message);
+    console.error("Order alert failed:", err.message);
   }
 }
 
-/* ===== SEND MSG (RETRY) ===== */
-async function sendMsg(sender, text, retry = 2) {
+/* ------------------- FACEBOOK SEND & TYPING ------------------- */
+async function sendTyping(senderId) {
   try {
     await axios.post(
       "https://graph.facebook.com/v18.0/me/messages",
-      { recipient: { id: sender }, message: { text } },
+      { recipient: { id: senderId }, sender_action: "typing_on" },
+      { params: { access_token: PAGE_ACCESS_TOKEN }, timeout: 3000 }
+    );
+  } catch {}
+}
+
+async function sendMessage(senderId, text, retry = 2) {
+  try {
+    await axios.post(
+      "https://graph.facebook.com/v18.0/me/messages",
+      { recipient: { id: senderId }, message: { text } },
       { params: { access_token: PAGE_ACCESS_TOKEN }, timeout: 8000 }
     );
-    console.log("✅ Sent");
   } catch (err) {
-    console.error("Send error:", err.response?.data || err.message);
     if (retry > 0) {
       await new Promise(r => setTimeout(r, 1000));
-      return sendMsg(sender, text, retry - 1);
+      return sendMessage(senderId, text, retry - 1);
     }
+    console.error("FB send error:", err.message);
   }
 }
 
-/* ===== TYPING ===== */
-function sendTyping(sender) {
-  axios.post(
-    "https://graph.facebook.com/v18.0/me/messages",
-    { recipient: { id: sender }, sender_action: "typing_on" },
-    { params: { access_token: PAGE_ACCESS_TOKEN }, timeout: 3000 }
-  ).catch(() => {});
-}
+/* ------------------- MAIN MESSAGE PROCESSOR ------------------- */
+async function processMessage(senderId, messageText) {
+  const session = getSession(senderId);
+  const lang = detectLanguage(messageText);
+  session.lang = lang;
 
-/* ===== IMAGE ===== */
-async function analyzeImage(url, products) {
-  try {
-    const img = await axios.get(url, { responseType: "arraybuffer", timeout: 10000 });
-    const base64 = Buffer.from(img.data).toString("base64");
-    const list = products.map(p => `- ${p.product_name} | ${p.price_bdt} BDT | ${p.color}`).join("\n");
+  // ========== ORDER DETAILS COLLECTION (after user expressed intent) ==========
+  if (session.collectingDetails) {
+    // Cancel order
+    if (/^(cancel|no|na|না|cancel order)$/i.test(messageText)) {
+      session.collectingDetails = false;
+      session.pendingOrderProduct = null;
+      return replyInLanguage(session.lang,
+        "❌ অর্ডার বাতিল করা হয়েছে।",
+        "❌ Order cancel kora hoyeche.",
+        "❌ Order has been cancelled."
+      );
+    }
 
-    const res = await groq.chat.completions.create({
-      model: "meta-llama/llama-4-scout-17b-16e-instruct",
-      max_tokens: 150,
-      messages: [{
-        role: "user",
-        content: [
-          { type: "image_url", image_url: { url: `data:image/jpeg;base64,${base64}` } },
-          { type: "text", text: `Shop products:\n${list}\n\nDoes image match any product? If yes → name + price in 1 sentence. If no → say: NOT_IN_SHOP` }
-        ]
-      }]
-    });
-    return res.choices[0].message.content.trim();
-  } catch (err) {
-    console.error("Image error:", err.message);
-    return null;
-  }
-}
+    const product = session.pendingOrderProduct;
 
-/* ===== GREETING ===== */
-function isGreeting(msg = "") {
-  return /^(hi|hello|hey|hii|hy|salam|salaam|assalam|হ্যালো)$/i.test(msg.trim());
-}
+    // Basic validation: must contain phone number (10-14 digits) and at least 3 words
+    const hasPhone = /\d{10,14}/.test(messageText);
+    const hasWords = messageText.trim().split(/\s+/).length >= 3;
 
-/* ===== MAIN LOGIC — FIX: "process" নাম বাদ ===== */
-async function handleMessage(sender, msg, products, h) {
-  const safeMsg = (msg || "").trim();
-  if (!safeMsg) return null;
+    if (!hasPhone || !hasWords) {
+      return replyInLanguage(session.lang,
+        "⚠️ দয়া করে আপনার নাম, ঠিকানা এবং মোবাইল নাম্বার সঠিকভাবে লিখুন।",
+        "⚠️ Please name, address, phone thik vabe likhun.",
+        "⚠️ Please provide valid name, address, and phone number."
+      );
+    }
 
-  const lang = getLang(safeMsg);
+    // Send ONE alert to seller (with customer details)
+    if (product) {
+      await sendOrderAlert(senderId, product, messageText);
+    }
 
-  // FIX 9: প্রথমবার lang set করো, পরে overwrite না
-  if (!h.lang) h.lang = lang;
+    session.collectingDetails = false;
+    session.pendingOrderProduct = null;
 
-  /* GREETING */
-  if (isGreeting(safeMsg)) {
-    return fmt(h.lang,
-      "👋 আস্সালামু আলাইকুম! আমি BizAssist। কোন product সম্পর্কে জানতে চান?",
-      "👋 Hi! Ami BizAssist. Kon product er khobor jante chan?",
-      "👋 Hi! I'm BizAssist. Which product would you like to know about?"
+    // Tell customer that seller will confirm (no bot confirmation)
+    return replyInLanguage(session.lang,
+      "⚠️ আপনার অর্ডার রিকোয়েস্ট seller এর কাছে পাঠানো হয়েছে। তিনি ফোনে যোগাযোগ করে confirm করবেন।",
+      "⚠️ Apnar order request seller er kache pathano hoyeche. Tini phone e contact kore confirm korben.",
+      "⚠️ Your order request has been sent to the seller. They will contact you by phone to confirm."
     );
   }
 
-  /* PRODUCT MATCH */
-  let product = findProduct(products, safeMsg);
+  // ========== NORMAL FLOW: product lookup, intents, AI fallback ==========
+  const products = await fetchProducts();
+  let product = findBestProduct(products, messageText);
 
-const isCtx = /\b(this|it|eta|eita|ota|eti)\b/i.test(safeMsg);
-const intent = getIntent(safeMsg);
-
-// FIX: context word ছাড়াও — শুধু intent থাকলে আগের product use করো
-if (!product && (isCtx || intent !== "general")) {
-  product = h.lastProduct;
-}
-
-  /* NO PRODUCT — FIX 5: list spam বাদ */
-  if (!product) {
-    if (intent === "order") {
-      return fmt(h.lang,
-        "কোন product order করতে চান সেটা বলুন।",
-        "Kon product order korte chan?",
-        "Which product would you like to order?"
-      );
-    }
-    // শুধু একবার list দেখাও, বারবার না
-    if (products.length > 0) {
-      return fmt(h.lang,
-        `❌ এই product পাওয়া যায়নি। আমাদের available products:\n${products.map(p => `• ${p.product_name}`).join("\n")}`,
-        `❌ Ei product nai. Available:\n${products.map(p => `• ${p.product_name}`).join("\n")}`,
-        `❌ Product not found. Available:\n${products.map(p => `• ${p.product_name}`).join("\n")}`
-      );
-    }
-    return fmt(h.lang,
-      "❌ এই product পাওয়া যায়নি।",
-      "❌ Ei product paowa jay nai.",
-      "❌ Product not available."
-    );
+  // Context follow‑up: "eta", "this", "same", etc.
+  const contextWords = /^(this|eta|ota|eita|same|that|ata|ta|eti)$/i;
+  if (!product && contextWords.test(messageText.trim()) && session.lastProduct) {
+    product = session.lastProduct;
   }
 
-  h.lastProduct = product;
+  const intent = detectIntent(messageText);
+  session.lastIntent = intent;
 
-  /* ORDER → সরাসরি alert */
+  if (product) {
+    session.lastProduct = product;
+    const name = product.product_name;
+    const price = product.price_bdt || "N/A";
+    const color = product.color || "N/A";
+    const inStock = product.stock_availability === "in_stock";
+
+    switch (intent) {
+      case "price":
+        return replyInLanguage(lang,
+          `${name} এর দাম ${price} টাকা।`,
+          `${name} er dam ${price} taka.`,
+          `${name} price is ${price} BDT.`
+        );
+      case "color":
+        return replyInLanguage(lang,
+          `${name} এর রং: ${color}`,
+          `${name} er color: ${color}`,
+          `${name} colors: ${color}`
+        );
+      case "stock":
+        return replyInLanguage(lang,
+          inStock ? `${name} available আছে।` : `${name} এখন নেই।`,
+          inStock ? `${name} ache.` : `${name} nai ekhon.`,
+          inStock ? `${name} is in stock.` : `${name} is out of stock.`
+        );
+      case "order":
+        // Do NOT send alert yet – first collect details
+        session.collectingDetails = true;
+        session.pendingOrderProduct = product;
+        return replyInLanguage(lang,
+          `🛒 "${name}" অর্ডার করতে চান।
+
+দয়া করে আপনার:
+• নাম
+• ঠিকানা
+• মোবাইল নাম্বার
+
+লিখে দিন। Seller আপনার তথ্য যাচাই করে ফোনে confirm করবে।`,
+          `🛒 "${name}" order korte chan.
+
+Please apnar:
+• Name
+• Address
+• Phone number
+
+din. Seller apnar info verify kore phone e confirm korbe.`,
+          `🛒 You want to order "${name}".
+
+Please provide:
+• Name
+• Address
+• Phone number
+
+The seller will verify and confirm your order by phone.`
+        );
+      default:
+        return replyInLanguage(lang,
+          `${name} — দাম: ${price} টাকা, রং: ${color}${inStock ? ", এখন available।" : ", এখন নেই।"}`,
+          `${name} — dam: ${price} taka, color: ${color}${inStock ? ", ache." : ", nai."}`,
+          `${name} — Price: ${price} BDT, Color: ${color}${inStock ? ", in stock." : ", out of stock."}`
+        );
+    }
+  }
+
+  // No product matched
   if (intent === "order") {
-    await sendAlert(sender, product, safeMsg);
-    return fmt(h.lang,
-      `🛒 "${product.product_name}" এর order seller কে পাঠানো হয়েছে। তিনি শীঘ্রই যোগাযোগ করবেন।`,
-      `🛒 "${product.product_name}" order seller ke pathano hoyeche. Tini contact korben.`,
-      `🛒 Order for "${product.product_name}" sent to seller. They will contact you shortly.`
+    return replyInLanguage(lang,
+      "কোন প্রোডাক্ট অর্ডার করতে চান? প্রোডাক্টের নাম বলুন।",
+      "Kon product order korte chan? Product er naam bolun.",
+      "Which product would you like to order? Please tell the product name."
     );
   }
 
-  return buildReply(h.lang, product, intent);
+  if (intent === "greeting") {
+    return replyInLanguage(lang,
+      "হ্যালো! আমি BizAssist। আপনি কোন প্রোডাক্ট সম্পর্কে জানতে চান?",
+      "Hello! Ami BizAssist. Apni kon product er kotha jante chan?",
+      "Hi! I'm BizAssist. What product would you like to know about?"
+    );
+  }
+
+  // AI fallback (only when unclear or no product matched)
+  const aiReply = await getAIHelp(messageText, session);
+  return aiReply || replyInLanguage(lang,
+    "আমি বুঝতে পারিনি। প্রোডাক্টের নাম বলুন।",
+    "Ami bujhte parini. Product er naam bolun.",
+    "I didn't understand. Please tell me a product name."
+  );
 }
 
-/* ===== WEBHOOK GET ===== */
+/* ------------------- WEBHOOK HANDLERS ------------------- */
 app.get("/webhook", (req, res) => {
   if (req.query["hub.verify_token"] === VERIFY_TOKEN) {
     return res.send(req.query["hub.challenge"]);
@@ -340,61 +474,58 @@ app.get("/webhook", (req, res) => {
   res.sendStatus(403);
 });
 
-/* ===== WEBHOOK POST ===== */
 app.post("/webhook", async (req, res) => {
   res.sendStatus(200);
+
   try {
-    for (const entry of req.body?.entry || []) {
-      for (const event of entry?.messaging || []) {
-        if (!event?.message || event.message.is_echo) continue;
+    for (const entry of req.body.entry || []) {
+      for (const event of entry.messaging || []) {
+        if (!event.message || event.message.is_echo) continue;
 
-        const sender = event.sender?.id;
-        const msg = event.message?.text || "";
-        const attachments = event.message?.attachments;
-        const mid = event.message?.mid;
+        const senderId = event.sender.id;
+        const messageId = event.message.mid;
+        const text = event.message.text || "";
+        const attachments = event.message.attachments;
 
-        if (!sender || !mid) continue;
-        if (seen.has(mid)) continue;
-        seen.set(mid, Date.now());
-        if (isSpam(sender)) continue;
+        if (processedMessages.has(messageId)) continue;
+        processedMessages.set(messageId, Date.now());
 
-        console.log(`💬 [${sender}]: ${msg || "image"}`);
-        sendTyping(sender);
+        const last = userCooldown.get(senderId) || 0;
+        if (Date.now() - last < COOLDOWN_MS) continue;
+        userCooldown.set(senderId, Date.now());
 
-        const products = await getProducts();
-        const h = getHistory(sender);
+        sendTyping(senderId);
+
         let reply = "";
 
-        /* IMAGE */
-        if (attachments?.[0]?.type === "image") {
-          const result = await analyzeImage(attachments[0].payload.url, products);
-          reply = (!result || result.includes("NOT_IN_SHOP"))
-            ? fmt(h.lang || "bl",
-                `এই product আমাদের shop এ নেই।\n\n${productList(products, "bn")}`,
-                `Ei product amader shop e nai.\n\n${productList(products, "bl")}`,
-                `Not in our shop.\n\n${productList(products, "en")}`
-              )
-            : result;
+        if (attachments && attachments[0]?.type === "image") {
+          const products = await fetchProducts();
+          const imageUrl = attachments[0].payload.url;
+          const analysis = await analyzeImage(imageUrl, products);
+          if (analysis.found) {
+            reply = analysis.reply;
+          } else {
+            const lang = detectLanguage(text);
+            reply = replyInLanguage(lang,
+              "এই ছবির প্রোডাক্টটি আমাদের শপে নেই। প্রোডাক্টের নাম বলুন।",
+              "Ei chhobir product ta amader shop e nai. Product er naam bolun.",
+              "This product is not in our shop. Please tell me the product name."
+            );
+          }
+        } else if (text) {
+          reply = await processMessage(senderId, text);
         }
 
-        /* TEXT */
-        else if (msg.trim()) {
-          // FIX: "process" এর বদলে "handleMessage"
-          reply = await handleMessage(sender, msg, products, h);
-          if (!reply) continue;
-        } else continue;
-
-        await sendMsg(sender, reply);
+        if (reply) await sendMessage(senderId, reply);
       }
     }
   } catch (err) {
-    console.error("WEBHOOK ERROR:", err.message);
+    console.error("Webhook processing error:", err.message);
   }
 });
 
-/* ===== HEALTH ===== */
-app.get("/", (req, res) => res.send("✅ BizAssist Running"));
+/* ------------------- HEALTH CHECK ------------------- */
+app.get("/", (req, res) => res.send("✅ BizAssist AI Assistant Running"));
 
-/* ===== START ===== */
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
