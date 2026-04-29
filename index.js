@@ -31,10 +31,11 @@ setInterval(() => {
   for (const [k, v] of historyMap) if (now - (v._t || 0) > 3600000) historyMap.delete(k);
 }, 60000);
 
+// FIX 6: spam filter 800ms
 function isSpam(id) {
   const now = Date.now();
   const last = cooldown.get(id) || 0;
-  if (now - last < 1500) return true;
+  if (now - last < 800) return true;
   cooldown.set(id, now);
   return false;
 }
@@ -53,33 +54,31 @@ async function getProducts() {
     });
 
     const raw = res.data;
-
-    // সব possible format handle করা
     let data = [];
     if (Array.isArray(raw)) data = raw;
     else if (Array.isArray(raw?.products)) data = raw.products;
     else if (Array.isArray(raw?.data)) data = raw.data;
     else if (raw && typeof raw === "object") {
-      // last resort — object এর ভেতরে array খোঁজো
       for (const val of Object.values(raw)) {
         if (Array.isArray(val) && val.length > 0) { data = val; break; }
       }
     }
 
+    // FIX 2: সবসময় cache update করো
+    cache = { data, time: now };
     console.log("✅ Products loaded:", data.length);
-    if (data.length > 0) cache = { data, time: now };
     return data;
 
   } catch (err) {
     console.error("❌ Product fetch:", err.message);
-    return cache.data; // পুরানো cache return করো
+    return cache.data.length ? cache.data : [];
   }
 }
 
 /* ===== HISTORY ===== */
 function getHistory(id) {
   if (!historyMap.has(id)) {
-    historyMap.set(id, { lastProduct: null, lang: "bl", _t: Date.now() });
+    historyMap.set(id, { lastProduct: null, lang: null, _t: Date.now() });
   }
   const h = historyMap.get(id);
   h._t = Date.now();
@@ -110,7 +109,7 @@ function findProduct(products, msg = "") {
     if (m.includes(p.product_name.toLowerCase())) return p;
   }
 
-  // fuzzy
+  // FIX 3: threshold 0.3
   let best = null, bestScore = 0;
   for (const p of products) {
     if (!p?.product_name) continue;
@@ -119,7 +118,7 @@ function findProduct(products, msg = "") {
     const score = words.length ? matched / words.length : 0;
     if (score > bestScore) { bestScore = score; best = p; }
   }
-  return bestScore >= 0.4 ? best : null;
+  return bestScore >= 0.3 ? best : null;
 }
 
 /* ===== INTENT ===== */
@@ -189,32 +188,21 @@ function productList(products, lang) {
   );
 }
 
-/* ===== FB NAME ===== */
-async function getFBName(id) {
-  try {
-    const res = await axios.get(
-      `https://graph.facebook.com/${id}?fields=name&access_token=${PAGE_ACCESS_TOKEN}`,
-      { timeout: 5000 }
-    );
-    return res.data?.name || "Customer";
-  } catch { return "Customer"; }
-}
-
 /* ===== ORDER ALERT ===== */
 async function sendAlert(senderId, product, msg) {
+  // FIX 8: getFBName skip — faster
   try {
-    const fbName = await getFBName(senderId);
     await axios.post(ALERT_URL, {
-      secret: WEBHOOK_API_KEY,        // ✅ fix: secret add করা হয়েছে
+      secret: WEBHOOK_API_KEY,
       seller_id: SELLER_ID,
       customer_fb_id: senderId,
-      customer_fb_name: fbName,
       product_name: product?.product_name || "Unknown",
       message: msg,
     }, { timeout: 5000 });
-    console.log("✅ Alert sent:", fbName, "→", product?.product_name);
+    console.log("✅ Alert sent:", product?.product_name);
   } catch (err) {
-    console.error("❌ Alert error:", err.message);
+    // FIX 7: response data log করো
+    console.error("❌ Alert error:", err.response?.data || err.message);
   }
 }
 
@@ -272,22 +260,24 @@ async function analyzeImage(url, products) {
 
 /* ===== GREETING ===== */
 function isGreeting(msg = "") {
-  return /^(hi|hello|hey|hii|hy|salam|salaam|assalam|কেমন|হ্যালো|হ্যালো)$/i.test(msg.trim());
+  return /^(hi|hello|hey|hii|hy|salam|salaam|assalam|হ্যালো)$/i.test(msg.trim());
 }
 
-/* ===== MAIN LOGIC ===== */
-async function process(sender, msg, products, h) {
+/* ===== MAIN LOGIC — FIX: "process" নাম বাদ ===== */
+async function handleMessage(sender, msg, products, h) {
   const safeMsg = (msg || "").trim();
   if (!safeMsg) return null;
 
   const lang = getLang(safeMsg);
-  h.lang = lang;
+
+  // FIX 9: প্রথমবার lang set করো, পরে overwrite না
+  if (!h.lang) h.lang = lang;
 
   /* GREETING */
   if (isGreeting(safeMsg)) {
-    return fmt(lang,
-      "👋 আস্সালামু আলাইকুম! আমি BizAssist। আপনি কোন product সম্পর্কে জানতে চান?",
-      "👋 Hi! Ami BizAssist. Apni kon product er khobor jante chan?",
+    return fmt(h.lang,
+      "👋 আস্সালামু আলাইকুম! আমি BizAssist। কোন product সম্পর্কে জানতে চান?",
+      "👋 Hi! Ami BizAssist. Kon product er khobor jante chan?",
       "👋 Hi! I'm BizAssist. Which product would you like to know about?"
     );
   }
@@ -295,38 +285,49 @@ async function process(sender, msg, products, h) {
   /* PRODUCT MATCH */
   let product = findProduct(products, safeMsg);
 
-  // context words
-  if (!product && /^(this|eta|ota|eita|ta|eti|same)$/i.test(safeMsg.trim())) {
-    product = h.lastProduct;
-  }
+  // FIX 4: context detection ভালো করা
+  const isCtx = /\b(this|it|eta|eita|ota|eti)\b/i.test(safeMsg);
+  if (!product && isCtx) product = h.lastProduct;
 
   const intent = getIntent(safeMsg);
 
-  /* NO PRODUCT */
+  /* NO PRODUCT — FIX 5: list spam বাদ */
   if (!product) {
     if (intent === "order") {
-      return fmt(lang,
+      return fmt(h.lang,
         "কোন product order করতে চান সেটা বলুন।",
         "Kon product order korte chan?",
         "Which product would you like to order?"
       );
     }
-    return productList(products, lang);
+    // শুধু একবার list দেখাও, বারবার না
+    if (products.length > 0) {
+      return fmt(h.lang,
+        `❌ এই product পাওয়া যায়নি। আমাদের available products:\n${products.map(p => `• ${p.product_name}`).join("\n")}`,
+        `❌ Ei product nai. Available:\n${products.map(p => `• ${p.product_name}`).join("\n")}`,
+        `❌ Product not found. Available:\n${products.map(p => `• ${p.product_name}`).join("\n")}`
+      );
+    }
+    return fmt(h.lang,
+      "❌ এই product পাওয়া যায়নি।",
+      "❌ Ei product paowa jay nai.",
+      "❌ Product not available."
+    );
   }
 
   h.lastProduct = product;
 
-  /* ORDER → সরাসরি alert, seller confirm করবে */
+  /* ORDER → সরাসরি alert */
   if (intent === "order") {
     await sendAlert(sender, product, safeMsg);
-    return fmt(lang,
-      `🛒 আপনার "${product.product_name}" এর order request seller কে পাঠানো হয়েছে। তিনি শীঘ্রই যোগাযোগ করবেন।`,
-      `🛒 "${product.product_name}" order request seller ke pathano hoyeche. Tini contact korben.`,
-      `🛒 Your order for "${product.product_name}" has been sent to the seller. They will contact you shortly.`
+    return fmt(h.lang,
+      `🛒 "${product.product_name}" এর order seller কে পাঠানো হয়েছে। তিনি শীঘ্রই যোগাযোগ করবেন।`,
+      `🛒 "${product.product_name}" order seller ke pathano hoyeche. Tini contact korben.`,
+      `🛒 Order for "${product.product_name}" sent to seller. They will contact you shortly.`
     );
   }
 
-  return buildReply(lang, product, intent);
+  return buildReply(h.lang, product, intent);
 }
 
 /* ===== WEBHOOK GET ===== */
@@ -376,7 +377,8 @@ app.post("/webhook", async (req, res) => {
 
         /* TEXT */
         else if (msg.trim()) {
-          reply = await process(sender, msg, products, h);
+          // FIX: "process" এর বদলে "handleMessage"
+          reply = await handleMessage(sender, msg, products, h);
           if (!reply) continue;
         } else continue;
 
