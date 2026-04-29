@@ -19,79 +19,52 @@ const ALERT_URL = `${BASE}/api/public/order-alert`;
 if (!PAGE_ACCESS_TOKEN) console.error("❌ PAGE_ACCESS_TOKEN missing!");
 if (!WEBHOOK_API_KEY) console.error("❌ WEBHOOK_API_KEY missing!");
 
-/* ===== MEMORY ===== */
-const seen = new Map();
-const historyMap = new Map();
-const cooldown = new Map();
+/* ===== MEMORY & CLEANUP ===== */
+const processedMessages = new Map();    // mid -> timestamp
+const userCooldown = new Map();         // senderId -> timestamp
+const userSessions = new Map();         // senderId -> session object
+
+const MESSAGE_TTL = 60000;
+const COOLDOWN_MS = 800;
 
 setInterval(() => {
   const now = Date.now();
-  for (const [k, t] of seen) if (now - t > 60000) seen.delete(k);
-  for (const [k, t] of cooldown) if (now - t > 60000) cooldown.delete(k);
-  for (const [k, v] of historyMap) if (now - (v._t || 0) > 7200000) historyMap.delete(k);
-}, 60000);
+  for (const [id, time] of processedMessages) if (now - time > MESSAGE_TTL) processedMessages.delete(id);
+  for (const [id, time] of userCooldown) if (now - time > MESSAGE_TTL) userCooldown.delete(id);
+  for (const [id, session] of userSessions) if (now - (session.lastActive || 0) > 3600000) userSessions.delete(id);
+}, 30000);
 
-function isSpam(id) {
+function isSpam(senderId) {
   const now = Date.now();
-  const last = cooldown.get(id) || 0;
-  if (now - last < 800) return true;
-  cooldown.set(id, now);
+  const last = userCooldown.get(senderId) || 0;
+  if (now - last < COOLDOWN_MS) return true;
+  userCooldown.set(senderId, now);
   return false;
 }
 
-/* ===== PRODUCT CACHE ===== */
-let cache = { data: [], time: 0 };
-
-async function getProducts() {
-  const now = Date.now();
-  if (cache.data.length && now - cache.time < 20000) return cache.data;
-  try {
-    const res = await axios.get(`${PRODUCTS_URL}?seller_id=${SELLER_ID}`, {
-      headers: { "x-api-key": WEBHOOK_API_KEY },
-      timeout: 8000,
-    });
-    const raw = res.data;
-    let data = [];
-    if (Array.isArray(raw)) data = raw;
-    else if (Array.isArray(raw?.products)) data = raw.products;
-    else if (Array.isArray(raw?.data)) data = raw.data;
-    else if (raw && typeof raw === "object") {
-      for (const val of Object.values(raw)) {
-        if (Array.isArray(val) && val.length > 0) { data = val; break; }
-      }
-    }
-    if (data.length > 0) cache = { data, time: now };
-    console.log("✅ Products loaded:", data.length);
-    return data.length > 0 ? data : cache.data;
-  } catch (err) {
-    console.error("❌ Product fetch:", err.response?.data || err.message);
-    return cache.data.length ? cache.data : [];
-  }
-}
-
-/* ===== HISTORY ===== */
-function getHistory(id) {
-  if (!historyMap.has(id)) {
-    historyMap.set(id, {
-      lastProduct: null,
-      lang: null,
-      orderStep: null,        // null, "awaiting_details", "awaiting_confirm"
+/* ===== SESSION MANAGER ===== */
+function getSession(senderId) {
+  if (!userSessions.has(senderId)) {
+    userSessions.set(senderId, {
+      lastProduct: null,          // last product object
+      lang: null,                 // "bn", "bl", "en"
+      orderStep: null,            // null, "awaiting_details", "awaiting_confirm"
       orderProduct: null,
       orderName: null,
       orderAddress: null,
       orderPhone: null,
-      _t: Date.now(),
+      lastActive: Date.now(),
     });
   }
-  const h = historyMap.get(id);
-  h._t = Date.now();
-  return h;
+  const sess = userSessions.get(senderId);
+  sess.lastActive = Date.now();
+  return sess;
 }
 
-/* ===== LANGUAGE ===== */
-function getLang(msg = "") {
+/* ===== LANGUAGE DETECTION ===== */
+function detectLanguage(msg = "") {
   if (/[\u0980-\u09FF]/.test(msg)) return "bn";
-  if (/\b(koto|dam|ache|nai|ki|taka|nibo|rong|lagbe|ase|chai|korbo|boro|valo|name|address|phone)\b/i.test(msg)) return "bl";
+  if (/\b(koto|dam|ache|nai|ki|taka|nibo|rong|lagbe|ase|chai|korbo|name|address|phone)\b/i.test(msg)) return "bl";
   return "en";
 }
 
@@ -101,94 +74,125 @@ function fmt(lang, bn, bl, en) {
   return en;
 }
 
+/* ===== PRODUCT CACHE ===== */
+let productCache = { data: [], time: 0 };
+let fetchingProducts = null;
+
+async function fetchProducts() {
+  if (fetchingProducts) return fetchingProducts;
+  fetchingProducts = (async () => {
+    const now = Date.now();
+    if (now - productCache.time < 20000 && productCache.data.length) return productCache.data;
+    try {
+      const res = await axios.get(`${PRODUCTS_URL}?seller_id=${SELLER_ID}`, {
+        headers: { "x-api-key": WEBHOOK_API_KEY },
+        timeout: 8000,
+      });
+      let data = [];
+      const raw = res.data;
+      if (Array.isArray(raw)) data = raw;
+      else if (Array.isArray(raw?.products)) data = raw.products;
+      else if (Array.isArray(raw?.data)) data = raw.data;
+      else if (raw && typeof raw === "object") {
+        for (const val of Object.values(raw)) {
+          if (Array.isArray(val) && val.length) { data = val; break; }
+        }
+      }
+      if (data.length) productCache = { data, time: now };
+      console.log("✅ Products loaded:", data.length);
+      return data.length ? data : productCache.data;
+    } catch (err) {
+      console.error("Product fetch error:", err.message);
+      return productCache.data;
+    } finally {
+      fetchingProducts = null;
+    }
+  })();
+  return fetchingProducts;
+}
+
 /* ===== FUZZY PRODUCT MATCH ===== */
-function findProduct(products, msg = "") {
-  if (!Array.isArray(products) || !msg) return null;
-  const m = msg.toLowerCase();
-
+function findBestProduct(products, query) {
+  if (!products.length || !query) return null;
+  const q = query.toLowerCase();
+  // Exact match first
   for (const p of products) {
-    if (!p?.product_name) continue;
-    if (m.includes(p.product_name.toLowerCase())) return p;
+    if (!p.product_name) continue;
+    if (q.includes(p.product_name.toLowerCase()) || p.product_name.toLowerCase().includes(q))
+      return p;
   }
-
+  // Word overlap scoring
   let best = null, bestScore = 0;
   for (const p of products) {
-    if (!p?.product_name) continue;
-    const words = p.product_name.toLowerCase().split(" ").filter(Boolean);
-    const matched = words.filter(w => w.length > 2 && m.includes(w)).length;
-    const score = words.length ? matched / words.length : 0;
-    if (score > bestScore) { bestScore = score; best = p; }
+    if (!p.product_name) continue;
+    const name = p.product_name.toLowerCase();
+    const nameWords = name.split(/\s+/).filter(w => w.length > 1);
+    const queryWords = q.split(/\s+/).filter(w => w.length > 1);
+    let match = 0;
+    for (const nw of nameWords) {
+      if (queryWords.some(qw => qw.includes(nw) || nw.includes(qw))) match++;
+    }
+    const score = nameWords.length ? match / nameWords.length : 0;
+    if (score > bestScore) {
+      bestScore = score;
+      best = p;
+    }
   }
-  return bestScore >= 0.4 ? best : null;
+  return bestScore >= 0.35 ? best : null;
 }
 
-/* ===== INTENT ===== */
-function getIntent(msg = "") {
-  const m = msg.toLowerCase();
-  if (/price|dam|koto|দাম|কত|cost|how much/.test(m)) return "price";
-  if (/color|colour|rong|রং/.test(m)) return "color";
-  if (/koyta|koyti|quantity|কয়টা/.test(m)) return "quantity";
-  if (/stock|ache|available|আছে|ase|in stock/.test(m)) return "stock";
-  if (/order|buy|nibo|নেব|korbo|kinte|lagbe|purchase|want to buy|i want/.test(m)) return "order";
-  return "general";
+/* ===== PRODUCT INFO REPLY ===== */
+function productInfoReply(lang, product, intent = "general") {
+  const name = product.product_name;
+  const price = product.price_bdt || "N/A";
+  const color = product.color || "N/A";
+  const inStock = product.stock_availability === "in_stock";
+  const qty = product.stock_count || product.quantity || null;
+
+  if (intent === "price") {
+    return fmt(lang,
+      `${name} এর দাম ${price} টাকা।`,
+      `${name} er price ${price} taka.`,
+      `${name} price is ${price} BDT.`
+    );
+  }
+  if (intent === "color") {
+    return fmt(lang,
+      `${name} এর রং: ${color}`,
+      `${name} er color: ${color}`,
+      `${name} colors: ${color}`
+    );
+  }
+  if (intent === "stock") {
+    return fmt(lang,
+      inStock ? `${name} এখন available আছে।` : `${name} এখন নেই।`,
+      inStock ? `${name} ache.` : `${name} nai ekhon.`,
+      inStock ? `${name} is in stock.` : `${name} is out of stock.`
+    );
+  }
+  if (intent === "quantity") {
+    if (qty) return fmt(lang, `${name} এখন ${qty}টা আছে।`, `${name} ekhon ${qty}ta ache.`, `${name} has ${qty} in stock.`);
+    return fmt(lang,
+      inStock ? `${name} আছে। পরিমাণ জানতে seller কে জিজ্ঞেস করুন।` : `${name} নেই।`,
+      inStock ? `${name} ache. Porimaan jante seller ke jiggesh korun.` : `${name} nai.`,
+      inStock ? `${name} is in stock. Ask seller for quantity.` : `${name} is out of stock.`
+    );
+  }
+  // Default general info
+  return fmt(lang,
+    `${name}\nদাম: ${price} টাকা\nরং: ${color}\nস্টক: ${inStock ? "✅ আছে" : "❌ নেই"}`,
+    `${name}\nPrice: ${price} taka\nColor: ${color}\nStock: ${inStock ? "✅ ache" : "❌ nai"}`,
+    `${name}\nPrice: ${price} BDT\nColor: ${color}\nStock: ${inStock ? "✅ in stock" : "❌ out of stock"}`
+  );
 }
 
-/* ===== DETECT PRODUCT QUERY (to exit order mode) ===== */
-function isProductQuery(msg = "") {
-  const m = msg.toLowerCase();
-  // If message contains product name from database match? We'll check later.
-  // Also common patterns: "ache", "ase", "do you have", "price koto", "dam", "color"
-  const productQuestion = /\b(ache|ase|do you have|have you|price|dam|koto|color|rong|stock|available)\b/i;
-  return productQuestion.test(m) && m.split(/\s+/).length <= 8;
-}
-
-/* ===== PRODUCT LIST ===== */
 function productListText(products, lang) {
-  if (!products.length) return fmt(lang, "কোনো product নেই।", "Kono product nai.", "No products available.");
+  if (!products.length) return fmt(lang, "কোনো product নেই।", "Kono product nai.", "No products.");
   const list = products.map(p => `• ${p.product_name} — ${p.price_bdt || "N/A"} BDT`).join("\n");
   return fmt(lang,
     `আমাদের products:\n${list}`,
     `Amader products:\n${list}`,
     `Our products:\n${list}`
-  );
-}
-
-/* ===== BUILD PRODUCT REPLY ===== */
-function buildReply(lang, p, intent) {
-  if (!p || !p.product_name) return fmt(lang, "Product তথ্য পাওয়া যায়নি।", "Product info nai.", "Product info not available.");
-  const name = p.product_name;
-  const price = p.price_bdt || "N/A";
-  const color = p.color || "N/A";
-  const inStock = p.stock_availability === "in_stock";
-  const qty = p.stock_count || p.quantity || null;
-
-  if (intent === "price") return fmt(lang,
-    `${name} এর দাম ${price} টাকা।`,
-    `${name} er price ${price} taka.`,
-    `${name} price is ${price} BDT.`
-  );
-  if (intent === "color") return fmt(lang,
-    `${name} এর রং: ${color}`,
-    `${name} er color: ${color}`,
-    `${name} colors: ${color}`
-  );
-  if (intent === "quantity") return qty
-    ? fmt(lang, `${name} এখন ${qty}টা আছে।`, `${name} ekhon ${qty}ta ache.`, `${name} has ${qty} in stock.`)
-    : fmt(lang,
-        inStock ? `${name} আছে। পরিমাণ জানতে seller কে জিজ্ঞেস করুন।` : `${name} নেই।`,
-        inStock ? `${name} ache. Porimaan jante seller ke jiggesh korun.` : `${name} nai.`,
-        inStock ? `${name} is in stock. Ask seller for quantity.` : `${name} is out of stock.`
-      );
-  if (intent === "stock") return fmt(lang,
-    inStock ? `${name} এখন available আছে।` : `${name} এখন stock এ নেই।`,
-    inStock ? `${name} ache.` : `${name} nai ekhon.`,
-    inStock ? `${name} is in stock.` : `${name} is out of stock.`
-  );
-  // General info
-  return fmt(lang,
-    `${name}\nদাম: ${price} টাকা\nরং: ${color}\nStatus: ${inStock ? "Available ✅" : "Out of stock ❌"}`,
-    `${name}\nPrice: ${price} taka\nColor: ${color}\nStatus: ${inStock ? "Available ✅" : "Out of stock ❌"}`,
-    `${name}\nPrice: ${price} BDT\nColor: ${color}\nStatus: ${inStock ? "Available ✅" : "Out of stock ❌"}`
   );
 }
 
@@ -200,179 +204,202 @@ async function sendOrderAlert(senderId, product, name, address, phone, originalM
       seller_id: SELLER_ID,
       customer_fb_id: senderId,
       customer_fb_name: name,
-      product_name: product?.product_name || "Unknown",
-      message: `🧾 Order Request (pending confirmation)\nName: ${name}\nAddress: ${address}\nPhone: ${phone}\nProduct: ${product?.product_name}\nMessage: ${originalMsg}`,
+      product_name: product.product_name,
+      message: `🧾 NEW ORDER REQUEST\nProduct: ${product.product_name}\nName: ${name}\nAddress: ${address}\nPhone: ${phone}\nOriginal message: ${originalMsg}`,
     }, { timeout: 5000 });
-    console.log("✅ Order alert sent:", product?.product_name, "←", name);
+    console.log("✅ Order alert sent");
   } catch (err) {
-    console.error("❌ Alert error:", err.response?.data || err.message);
+    console.error("Alert error:", err.message);
   }
 }
 
-/* ===== PARSE ORDER DETAILS (robust, no commas required) ===== */
-function parseOrderDetails(msg = "") {
-  // Extract phone number (Bangladeshi 11-digit or any 10-14 digits)
+/* ===== PARSE ORDER DETAILS (flexible) ===== */
+function parseOrderDetails(msg) {
+  // Extract phone number (10-14 digits)
   let phone = null;
   const phoneMatch = msg.match(/\b(\+?880|0)?\d{10,11}\b/);
   if (phoneMatch) phone = phoneMatch[0];
-
-  // Remove phone number from the string
   let remaining = phone ? msg.replace(phoneMatch[0], "") : msg;
-  // Also remove common punctuation
   remaining = remaining.replace(/[,،\n]+/g, " ").trim();
-
-  let name = null, address = null;
   const words = remaining.split(/\s+/).filter(w => w.length > 0);
-  if (words.length === 0) {
-    return { name: null, address: null, phone };
+  let name = null, address = null;
+  if (words.length) {
+    name = words[0];
+    if (words.length > 1) address = words.slice(1).join(" ");
   }
-  // First word = name, rest = address
-  name = words[0];
-  if (words.length > 1) address = words.slice(1).join(" ");
-  else address = null;
-
-  // If address still missing but remaining has commas, try alternative split
+  // If no address but contains commas, try comma split
   if (!address && remaining.includes(",")) {
     const parts = remaining.split(",").map(s => s.trim());
     name = parts[0] || name;
     address = parts.slice(1).join(", ") || null;
   }
-
   return { name, address, phone };
 }
 
-/* ===== GREETING CHECK ===== */
-function isGreeting(msg = "") {
+/* ===== AI FEATURE / FALLBACK ===== */
+async function aiReply(userMsg, product, sessionLang) {
+  const systemPrompt = `You are BizAssist, a friendly shop assistant.
+Rules:
+- NEVER invent products, prices, colors, or stock.
+- Only answer based on the product info provided below.
+- Keep replies SHORT (1-2 sentences).
+- Match the user's language (English/Bangla/Banglish).
+
+Product info:
+Name: ${product.product_name}
+Price: ${product.price_bdt || "N/A"} BDT
+Color: ${product.color || "N/A"}
+Stock: ${product.stock_availability === "in_stock" ? "In stock" : "Out of stock"}
+Description: ${product.description || "No detailed description available"}
+
+Conversation context: The user just asked about this product. Reply helpfully.`;
+  try {
+    const res = await groq.chat.completions.create({
+      model: "llama-3.3-70b-versatile",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userMsg }
+      ],
+      max_tokens: 120,
+      temperature: 0.3,
+    });
+    return res.choices[0].message.content.trim();
+  } catch (err) {
+    console.error("AI error:", err.message);
+    return productInfoReply(sessionLang, product, "general");
+  }
+}
+
+/* ===== GREETING DETECTION ===== */
+function isGreeting(msg) {
   const m = msg.trim().toLowerCase();
-  return /^(hi|hello|hey|hii|hy|salam|salaam|assalamualaikum|assalam|হ্যালো|হাই|শুভ|good morning|good evening|start|shuru|hi there|hey there)$/i.test(m);
+  return /^(hi|hello|hey|hii|hy|salam|salaam|assalamualaikum|হ্যালো|হাই|good morning|start|shuru|hey there)$/i.test(m);
+}
+
+/* ===== INTENT DETECTION ===== */
+function detectIntent(msg) {
+  const m = msg.toLowerCase();
+  if (/price|dam|koto|দাম|কত|how much|cost/.test(m)) return "price";
+  if (/color|colour|rong|রং/.test(m)) return "color";
+  if (/stock|ache|available|আছে|ase|in stock|do you have/.test(m)) return "stock";
+  if (/quantity|koyta|koyti|কয়টা/.test(m)) return "quantity";
+  if (/order|buy|nibo|নেব|kinbo|লাগবে|i want|purchase/.test(m)) return "order";
+  return "general";
 }
 
 /* ===== IMAGE ANALYSIS ===== */
-async function analyzeImage(url, products) {
+async function analyzeImage(imageUrl, products) {
   try {
-    const img = await axios.get(url, {
-      responseType: "arraybuffer",
-      timeout: 15000,
-    });
+    const img = await axios.get(imageUrl, { responseType: "arraybuffer", timeout: 15000 });
     const base64 = Buffer.from(img.data).toString("base64");
     const contentType = img.headers["content-type"] || "image/jpeg";
-    const list = products.map(p =>
-      `- ${p.product_name} | ${p.price_bdt || "N/A"} BDT | color: ${p.color || "N/A"}`
-    ).join("\n");
-
+    const productList = products.map(p => `- ${p.product_name} (${p.price_bdt || "N/A"} BDT, color: ${p.color || "N/A"})`).join("\n");
     const res = await groq.chat.completions.create({
-      model: "meta-llama/llama-4-scout-17b-16e-instruct",
-      max_tokens: 200,
-      messages: [{
-        role: "user",
-        content: [
-          { type: "image_url", image_url: { url: `data:${contentType};base64,${base64}` } },
-          {
-            type: "text",
-            text: `You are a shop assistant. Our products:\n${list}\n\nLook at the image carefully. Does it match any product in the list? If YES → reply with: product name, price, color in 1-2 sentences. If NO match → reply exactly: NOT_IN_SHOP`
-          }
-        ]
-      }]
+      model: "llama-3.2-11b-vision-preview",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "image_url", image_url: { url: `data:${contentType};base64,${base64}` } },
+            { type: "text", text: `Match this image to one of our products. Our products:\n${productList}\nIf a match is found, reply with the EXACT product name (nothing else). If no match, reply "NOT_IN_SHOP".` }
+          ]
+        }
+      ],
+      max_tokens: 50,
     });
-
-    const result = res.choices[0].message.content.trim();
-    console.log("🖼️ Image AI result:", result);
-    return result;
+    const answer = res.choices[0].message.content.trim();
+    if (answer !== "NOT_IN_SHOP") {
+      const matched = findBestProduct(products, answer);
+      if (matched) return matched;
+    }
+    return null;
   } catch (err) {
-    console.error("❌ Image error:", err.message);
+    console.error("Image analysis error:", err.message);
     return null;
   }
 }
 
-/* ===== AI FEATURE REPLY ===== */
-async function getFeatureReply(product, userMsg, lang) {
+/* ===== SEND MESSAGE ===== */
+async function sendMessage(senderId, text, retry = 2) {
   try {
-    const res = await groq.chat.completions.create({
-      model: "llama-3.3-70b-versatile",
-      max_tokens: 120,
-      temperature: 0.3,
-      messages: [
-        {
-          role: "system",
-          content: `You are BizAssist, a shop assistant. Answer ONLY about this product: 
-Name: ${product.product_name}
-Price: ${product.price_bdt || "N/A"} BDT
-Color: ${product.color || "N/A"}
-Stock: ${product.stock_availability || "unknown"}
-Description: ${product.description || "No description available"}
-
-Rules:
-- Keep reply under 3 sentences
-- Only use the info given above, do NOT make up features
-- If no description is given, say you don't have detailed specs but mention name, price, color
-- Match language: Bengali script → Bengali, Banglish → Banglish, English → English`
-        },
-        { role: "user", content: userMsg }
-      ]
-    });
-    return res.choices[0].message.content.trim();
+    await axios.post(
+      "https://graph.facebook.com/v18.0/me/messages",
+      { recipient: { id: senderId }, message: { text } },
+      { params: { access_token: PAGE_ACCESS_TOKEN }, timeout: 8000 }
+    );
+    console.log("✅ Sent to", senderId);
   } catch (err) {
-    console.error("AI feature error:", err.message);
-    return buildReply(lang, product, "general");
+    if (retry > 0) {
+      await new Promise(r => setTimeout(r, 1000));
+      return sendMessage(senderId, text, retry - 1);
+    }
+    console.error("Send error:", err.response?.data || err.message);
   }
 }
 
-/* ===== MESSAGE HANDLER ===== */
-async function handleMessage(sender, msg, products, h) {
-  const safeMsg = (msg || "").trim();
-  if (!safeMsg) return null;
+function sendTyping(senderId) {
+  axios.post(
+    "https://graph.facebook.com/v18.0/me/messages",
+    { recipient: { id: senderId }, sender_action: "typing_on" },
+    { params: { access_token: PAGE_ACCESS_TOKEN }, timeout: 3000 }
+  ).catch(() => {});
+}
 
-  // Set language once
-  if (!h.lang) h.lang = getLang(safeMsg);
-  const lang = h.lang;
+/* ===== MAIN MESSAGE PROCESSOR ===== */
+async function processMessage(senderId, messageText, imageProduct = null) {
+  const session = getSession(senderId);
+  const lang = session.lang || detectLanguage(messageText);
+  session.lang = lang;
 
-  // ========== ORDER FLOW ==========
-  if (h.orderStep === "awaiting_details") {
-    // If user asks about a product (e.g., "gold braclte ache"), exit order mode and answer that product instead.
-    const anyProduct = findProduct(products, safeMsg);
+  // If an image was matched, set that as the current product
+  if (imageProduct) {
+    session.lastProduct = imageProduct;
+  }
+
+  // ----- ORDER FLOW -----
+  if (session.orderStep === "awaiting_details") {
+    // If user asks a product question instead of giving details, exit order mode
+    const anyProduct = findBestProduct(await fetchProducts(), messageText);
     if (anyProduct) {
-      // Cancel order and treat as normal product query
-      h.orderStep = null;
-      h.orderProduct = null;
-      // Fall through to normal product handling below
+      session.orderStep = null;
+      session.orderProduct = null;
+      // fall through to normal product handling
     } else {
-      // Try to parse details
-      const { name, address, phone } = parseOrderDetails(safeMsg);
+      const { name, address, phone } = parseOrderDetails(messageText);
       if (!name || !address || !phone) {
         return fmt(lang,
-          `আপনার তথ্য পুরোপুরি পাইনি। দয়া করে লিখুন:\n\nনাম, ঠিকানা, মোবাইল নাম্বার\nউদাহরণ: Rahim, Dhaka Mirpur 10, 01712345678`,
-          `Apnar info purono pailam na. Eivabe likhen:\n\nNaam, Address, Phone\nUdaharon: Rahim, Dhaka Mirpur 10, 01712345678`,
-          `Couldn't get all your details. Please write:\n\nName, Address, Phone\nExample: Rahim, Dhaka Mirpur 10, 01712345678`
+          `আপনার তথ্য পুরোপুরি পাইনি। দয়া করে লিখুন:\nনাম, ঠিকানা, মোবাইল নাম্বার\nউদাহরণ: Rahim, Dhaka Mirpur 10, 01712345678`,
+          `Apnar info puropuri pailam na. Likhen:\nNaam, Address, Phone\nUdaharon: Rahim, Dhaka Mirpur 10, 01712345678`,
+          `Couldn't get your full details. Please write:\nName, Address, Phone\nExample: Rahim, Dhaka Mirpur 10, 01712345678`
         );
       }
-      h.orderName = name;
-      h.orderAddress = address;
-      h.orderPhone = phone;
-      h.orderStep = "awaiting_confirm";
+      session.orderName = name;
+      session.orderAddress = address;
+      session.orderPhone = phone;
+      session.orderStep = "awaiting_confirm";
       return fmt(lang,
-        `✅ আপনার order details:\n\nProduct: ${h.orderProduct.product_name}\nনাম: ${name}\nঠিকানা: ${address}\nফোন: ${phone}\n\nConfirm করতে "yes" লিখুন, বাতিল করতে "no" লিখুন।`,
-        `✅ Apnar order details:\n\nProduct: ${h.orderProduct.product_name}\nNaam: ${name}\nAddress: ${address}\nPhone: ${phone}\n\nConfirm korte "yes" likhen, cancel korte "no" likhen.`,
-        `✅ Your order details:\n\nProduct: ${h.orderProduct.product_name}\nName: ${name}\nAddress: ${address}\nPhone: ${phone}\n\nType "yes" to confirm, "no" to cancel.`
+        `✅ আপনার order details:\n\nProduct: ${session.orderProduct.product_name}\nনাম: ${name}\nঠিকানা: ${address}\nফোন: ${phone}\n\nConfirm করতে "yes" লিখুন, বাতিল করতে "no" লিখুন।`,
+        `✅ Apnar order details:\n\nProduct: ${session.orderProduct.product_name}\nNaam: ${name}\nAddress: ${address}\nPhone: ${phone}\n\nConfirm korte "yes" likhen, cancel korte "no" likhen.`,
+        `✅ Your order details:\n\nProduct: ${session.orderProduct.product_name}\nName: ${name}\nAddress: ${address}\nPhone: ${phone}\n\nType "yes" to confirm, "no" to cancel.`
       );
     }
   }
 
-  if (h.orderStep === "awaiting_confirm") {
-    const m = safeMsg.toLowerCase().trim();
-    const isYes = /^(yes|haa|ha|ok|okay|ji|sure|confirm|haan|han|yep)$/i.test(m);
+  if (session.orderStep === "awaiting_confirm") {
+    const m = messageText.toLowerCase().trim();
+    const isYes = /^(yes|haa|ha|ok|okay|sure|confirm|haan|han|yep)$/i.test(m);
     const isNo = /^(no|na|না|nah|nope|nai|cancel|bata|naa)$/i.test(m);
     if (isYes) {
-      const product = h.orderProduct;
-      const name = h.orderName;
-      const address = h.orderAddress;
-      const phone = h.orderPhone;
-      await sendOrderAlert(sender, product, name, address, phone, safeMsg);
-      // Reset order state
-      h.orderStep = null;
-      h.orderProduct = null;
-      h.orderName = null;
-      h.orderAddress = null;
-      h.orderPhone = null;
+      const product = session.orderProduct;
+      const name = session.orderName;
+      const address = session.orderAddress;
+      const phone = session.orderPhone;
+      await sendOrderAlert(senderId, product, name, address, phone, "Customer confirmed order");
+      session.orderStep = null;
+      session.orderProduct = null;
+      session.orderName = null;
+      session.orderAddress = null;
+      session.orderPhone = null;
       return fmt(lang,
         `🛒 আপনার order confirm হয়েছে!\n\nProduct: ${product.product_name}\nSeller শীঘ্রই আপনার সাথে যোগাযোগ করবেন।`,
         `🛒 Apnar order confirm hoyeche!\n\nProduct: ${product.product_name}\nSeller shighroi contact korben.`,
@@ -380,15 +407,12 @@ async function handleMessage(sender, msg, products, h) {
       );
     }
     if (isNo) {
-      h.orderStep = null;
-      h.orderProduct = null;
-      h.orderName = null;
-      h.orderAddress = null;
-      h.orderPhone = null;
+      session.orderStep = null;
+      session.orderProduct = null;
       return fmt(lang,
-        "❌ Order বাতিল হয়েছে। আর কিছু জানতে চাইলে বলুন।",
-        "❌ Order cancel hoyeche. Aro kichu jante chaile bolun.",
-        "❌ Order cancelled. Let me know if you need anything else."
+        "❌ Order বাতিল করা হয়েছে।",
+        "❌ Order cancel hoyeche.",
+        "❌ Order cancelled."
       );
     }
     return fmt(lang,
@@ -398,8 +422,9 @@ async function handleMessage(sender, msg, products, h) {
     );
   }
 
-  // ========== GREETING ==========
-  if (isGreeting(safeMsg)) {
+  // ----- GREETING -----
+  if (isGreeting(messageText)) {
+    const products = await fetchProducts();
     const list = productListText(products, lang);
     return fmt(lang,
       `👋 আস্সালামু আলাইকুম! আমি BizAssist, আপনার shop assistant।\n\n${list}\n\nকোনটার কথা জানতে চান?`,
@@ -408,40 +433,43 @@ async function handleMessage(sender, msg, products, h) {
     );
   }
 
-  // ========== PRODUCT MATCH ==========
-  let product = findProduct(products, safeMsg);
+  // ----- PRODUCT LOOKUP -----
+  const products = await fetchProducts();
+  let product = session.lastProduct || findBestProduct(products, messageText);
 
-  // Context fallback for "this", "eta", "same" etc.
-  const isCtxWord = /\b(this|it|eta|eita|ota|eti|same|ata)\b/i.test(safeMsg);
-  if (!product && isCtxWord && h.lastProduct) product = h.lastProduct;
-  // Also if no product but lastProduct exists and intent is not general (e.g., "price koto?")
-  const intent = getIntent(safeMsg);
-  if (!product && h.lastProduct && intent !== "general") product = h.lastProduct;
+  // Context follow-up (this, eta, same)
+  const contextWords = /^(this|eta|eita|ota|same|that|ata|eti|this one)$/i;
+  if (!product && contextWords.test(messageText.trim()) && session.lastProduct) {
+    product = session.lastProduct;
+  }
 
+  const intent = detectIntent(messageText);
+
+  // If we don't have a product yet, try to match again (maybe user typed product name)
+  if (!product) product = findBestProduct(products, messageText);
   if (!product) {
-    // No product found – show list
-    const list = productListText(products, lang);
     if (intent === "order") {
       return fmt(lang,
-        "কোন প্রোডাক্ট অর্ডার করতে চান? প্রোডাক্টের নাম বলুন।",
+        "কোন product order করতে চান? প্রোডাক্টের নাম বলুন।",
         "Kon product order korte chan? Naam bolun.",
         "Which product would you like to order? Please tell me the product name."
       );
     }
+    const list = productListText(products, lang);
     return fmt(lang,
-      `❌ এই প্রোডাক্ট পাওয়া যায়নি।\n\n${list}\n\nআবার চেষ্টা করুন।`,
+      `❌ এই product পাওয়া যায়নি।\n\n${list}\n\nআবার চেষ্টা করুন।`,
       `❌ Ei product paoa jai nai.\n\n${list}\n\nAbar try korun.`,
       `❌ Product not found.\n\n${list}\n\nPlease try again.`
     );
   }
 
-  // Save last product
-  h.lastProduct = product;
+  // Save last product for context
+  session.lastProduct = product;
 
-  // ========== ORDER INTENT ==========
+  // ----- ORDER INTENT -----
   if (intent === "order") {
-    h.orderStep = "awaiting_details";
-    h.orderProduct = product;
+    session.orderStep = "awaiting_details";
+    session.orderProduct = product;
     return fmt(lang,
       `🛒 "${product.product_name}" অর্ডার করতে চান!\n\nআপনার তথ্য দিন:\nনাম, ঠিকানা, মোবাইল নাম্বার\nউদাহরণ: Rahim, Dhaka Mirpur 10, 01712345678`,
       `🛒 "${product.product_name}" order korte chaichen!\n\nApnar info din:\nNaam, Address, Phone\nUdaharon: Rahim, Dhaka Mirpur 10, 01712345678`,
@@ -449,17 +477,14 @@ async function handleMessage(sender, msg, products, h) {
     );
   }
 
-  // ========== FEATURE / GENERAL QUESTIONS ==========
-  if (intent === "general") {
-    const isFeatureQ = /feature|detail|describe|what is|kemon|kirokom|ki ache|spec|quality|material|made of|er ki|eta ki/.test(safeMsg.toLowerCase());
-    if (isFeatureQ) {
-      const aiReply = await getFeatureReply(product, safeMsg, lang);
-      return aiReply;
-    }
+  // ----- STANDARD INTENTS (price, color, stock, quantity) -----
+  if (["price", "color", "stock", "quantity"].includes(intent)) {
+    return productInfoReply(lang, product, intent);
   }
 
-  // ========== STANDARD REPLY (price, color, stock, etc.) ==========
-  return buildReply(lang, product, intent);
+  // ----- GENERAL / FEATURE QUESTIONS (use AI) -----
+  const aiResponse = await aiReply(messageText, product, lang);
+  return aiResponse;
 }
 
 /* ===== WEBHOOK ===== */
@@ -473,79 +498,52 @@ app.get("/webhook", (req, res) => {
 app.post("/webhook", async (req, res) => {
   res.sendStatus(200);
   try {
-    for (const entry of req.body?.entry || []) {
-      for (const event of entry?.messaging || []) {
-        if (!event?.message || event.message.is_echo) continue;
+    for (const entry of req.body.entry || []) {
+      for (const event of entry.messaging || []) {
+        if (!event.message || event.message.is_echo) continue;
+        const senderId = event.sender.id;
+        const messageId = event.message.mid;
+        if (processedMessages.has(messageId)) continue;
+        processedMessages.set(messageId, Date.now());
+        if (isSpam(senderId)) continue;
 
-        const sender = event.sender?.id;
-        const msg = event.message?.text || "";
-        const attachments = event.message?.attachments;
-        const mid = event.message?.mid;
+        sendTyping(senderId);
 
-        if (!sender || !mid) continue;
-        if (seen.has(mid)) continue;
-        seen.set(mid, Date.now());
-        if (isSpam(sender)) continue;
-
-        console.log(`💬 [${sender}]: ${msg || "[image]"}`);
-        sendTyping(sender);
-
-        const products = await getProducts();
-        const h = getHistory(sender);
+        const attachments = event.message.attachments;
         let reply = "";
+        let imageProduct = null;
 
-        if (attachments?.[0]?.type === "image") {
-          console.log("🖼️ Image received");
-          const result = await analyzeImage(attachments[0].payload.url, products);
-          if (!result || result.includes("NOT_IN_SHOP")) {
-            reply = fmt(h.lang || "en",
-              `এই product আমাদের shop এ নেই।\n\n${productListText(products, "bn")}`,
-              `Ei product amader shop e nai.\n\n${productListText(products, "bl")}`,
-              `This product is not in our shop.\n\n${productListText(products, "en")}`
-            );
+        if (attachments && attachments[0]?.type === "image") {
+          const imageUrl = attachments[0].payload.url;
+          const products = await fetchProducts();
+          imageProduct = await analyzeImage(imageUrl, products);
+          if (imageProduct) {
+            // Successfully matched image to a product
+            reply = productInfoReply(detectLanguage(""), imageProduct, "general");
+            // Save the product in session for follow-up
+            const session = getSession(senderId);
+            session.lastProduct = imageProduct;
           } else {
-            reply = result;
+            const lang = detectLanguage("");
+            reply = fmt(lang,
+              `এই ছবির productটি আমাদের shop এ নেই।\n\n${productListText(await fetchProducts(), "bn")}`,
+              `Ei chhobir product ta amader shop e nai.\n\n${productListText(await fetchProducts(), "bl")}`,
+              `This product is not in our shop.\n\n${productListText(await fetchProducts(), "en")}`
+            );
           }
-        } else if (msg.trim()) {
-          reply = await handleMessage(sender, msg, products, h);
+        } else if (event.message.text) {
+          reply = await processMessage(senderId, event.message.text, imageProduct);
         } else continue;
 
-        if (reply) await sendMsg(sender, reply);
+        if (reply) await sendMessage(senderId, reply);
       }
     }
   } catch (err) {
-    console.error("WEBHOOK ERROR:", err.message);
+    console.error("Webhook error:", err.message);
   }
 });
 
-/* ===== SEND MESSAGE ===== */
-async function sendMsg(sender, text, retry = 2) {
-  try {
-    await axios.post(
-      "https://graph.facebook.com/v18.0/me/messages",
-      { recipient: { id: sender }, message: { text } },
-      { params: { access_token: PAGE_ACCESS_TOKEN }, timeout: 8000 }
-    );
-    console.log("✅ Sent to", sender);
-  } catch (err) {
-    console.error("Send error:", err.response?.data || err.message);
-    if (retry > 0) {
-      await new Promise(r => setTimeout(r, 1000));
-      return sendMsg(sender, text, retry - 1);
-    }
-  }
-}
-
-function sendTyping(sender) {
-  axios.post(
-    "https://graph.facebook.com/v18.0/me/messages",
-    { recipient: { id: sender }, sender_action: "typing_on" },
-    { params: { access_token: PAGE_ACCESS_TOKEN }, timeout: 3000 }
-  ).catch(() => {});
-}
-
-/* ===== HEALTH ===== */
-app.get("/", (req, res) => res.send("✅ BizAssist Running"));
+app.get("/", (req, res) => res.send("✅ BizAssist Smart Bot Running"));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 BizAssist running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
