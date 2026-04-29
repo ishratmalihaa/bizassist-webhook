@@ -285,11 +285,13 @@ async function handleMessage(sender, msg, products, h) {
   /* PRODUCT MATCH */
   let product = findProduct(products, safeMsg);
 
-  // FIX 4: context detection ভালো করা
-  const isCtx = /\b(this|it|eta|eita|ota|eti)\b/i.test(safeMsg);
-  if (!product && isCtx) product = h.lastProduct;
+const isCtx = /\b(this|it|eta|eita|ota|eti)\b/i.test(safeMsg);
+const intent = getIntent(safeMsg);
 
-  const intent = getIntent(safeMsg);
+// FIX: context word ছাড়াও — শুধু intent থাকলে আগের product use করো
+if (!product && (isCtx || intent !== "general")) {
+  product = h.lastProduct;
+}
 
   /* NO PRODUCT — FIX 5: list spam বাদ */
   if (!product) {
