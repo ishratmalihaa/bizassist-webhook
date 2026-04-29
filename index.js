@@ -57,7 +57,7 @@ setInterval(() => {
   }
 }, 30000);
 
-/* ------------------- SESSION (with state & history) ------------------- */
+/* ------------------- SESSION ------------------- */
 function getSession(senderId) {
   if (!userSessions.has(senderId)) {
     userSessions.set(senderId, {
@@ -169,7 +169,7 @@ function replyInLanguage(lang, bn, bl, en) {
   return en;
 }
 
-/* ------------------- AI FALLBACK (safe) ------------------- */
+/* ------------------- AI FALLBACK ------------------- */
 async function getAIHelp(userMessage, session) {
   if (!groq) return "I'm having trouble thinking. Please try again.";
   try {
@@ -213,7 +213,7 @@ Reply helpfully but without inventing product details.`,
   }
 }
 
-/* ------------------- IMAGE ANALYSIS ------------------- */
+/* ------------------- IMAGE ANALYSIS (improved) ------------------- */
 async function resolveImageUrl(attachment) {
   if (attachment?.payload?.url) return attachment.payload.url;
   return null;
@@ -235,7 +235,7 @@ async function safeImageBuffer(url) {
 
 async function analyzeImage(attachment, products) {
   const imageUrl = await resolveImageUrl(attachment);
-  if (!imageUrl) return { found: false, reply: null };
+  if (!imageUrl) return { found: false, reply: "Could not get image URL." };
 
   const buffer = await safeImageBuffer(imageUrl);
   if (!buffer) return { found: false, reply: "Image not accessible. Please describe the product." };
@@ -263,10 +263,10 @@ async function analyzeImage(attachment, products) {
       if (matched)
         return { found: true, product: matched, reply: `${matched.product_name} — ${matched.price_bdt || "N/A"} BDT` };
     }
-    return { found: false, reply: null };
+    return { found: false, reply: "I couldn't recognize this product. Please tell me the product name." };
   } catch (err) {
     console.error("Vision error:", err.message);
-    return { found: false, reply: null };
+    return { found: false, reply: "Image recognition failed. Please describe the product." };
   }
 }
 
@@ -314,8 +314,10 @@ async function sendMessage(senderId, text, retry = 2) {
 }
 
 /* ------------------- MAIN PROCESSOR ------------------- */
-function isSimpleFollowUp(text) {
-  return /^(ok|ঠিক আছে|yes|yes ok|k|kk|👍|thik ache|হ্যাঁ|ঠিক)$/i.test(text);
+function isProductQuery(text) {
+  // Heuristic: if text contains words that look like asking for a product
+  const productQuestion = /\b(ache|ase|have|do you have|available|price|dam|koto|color|rong|stock|order|buy|nibo|lagbe|\?)\b/i;
+  return productQuestion.test(text) && text.split(/\s+/).length <= 8;
 }
 
 async function processMessage(senderId, messageText) {
@@ -331,19 +333,9 @@ async function processMessage(senderId, messageText) {
   const lang = detectLanguage(messageText);
   session.lang = lang;
 
-  // simple follow-up after product info
-  if (session.state === "product_viewed" && isSimpleFollowUp(messageText) && session.lastProduct) {
-    const reply = replyInLanguage(lang,
-      `আপনি কি "${session.lastProduct.product_name}" নিয়ে কিছু জানতে চান? দাম, স্টক, অর্ডার বলতে পারেন।`,
-      `Apni ki "${session.lastProduct.product_name}" niye jante chan? price, stock, order bolte paren.`,
-      `Do you want to know more about "${session.lastProduct.product_name}"? Price, stock, or order?`
-    );
-    addHistory(session, "assistant", reply);
-    return reply;
-  }
-
   // ----- COLLECTING DETAILS (order flow) -----
   if (session.collectingDetails) {
+    // Cancel order if user asks for a different product or says cancel
     if (/^(cancel|no|na|না|cancel order)$/i.test(messageText)) {
       session.collectingDetails = false;
       session.pendingOrderProduct = null;
@@ -355,29 +347,38 @@ async function processMessage(senderId, messageText) {
         "❌ Order cancelled."
       );
     }
-    const product = session.pendingOrderProduct;
-    const hasPhone = /\d{10,14}/.test(messageText);
-    const hasWords = messageText.trim().split(/\s+/).length >= 3;
-    if (!hasPhone || !hasWords) {
+
+    // If user message looks like a product query (e.g., "gold bracelet ache"), exit order mode and answer product
+    if (isProductQuery(messageText)) {
+      session.collectingDetails = false;
+      session.pendingOrderProduct = null;
+      session.state = "browsing";
+      // Continue to normal product lookup below
+    } else {
+      // Otherwise, validate details
+      const product = session.pendingOrderProduct;
+      const hasPhone = /\d{10,14}/.test(messageText);
+      const hasWords = messageText.trim().split(/\s+/).length >= 3;
+      if (!hasPhone || !hasWords) {
+        return replyInLanguage(session.lang,
+          "⚠️ দয়া করে নাম, ঠিকানা ও মোবাইল নাম্বার সঠিকভাবে লিখুন।",
+          "⚠️ Name, address, phone thik likhun.",
+          "⚠️ Please provide name, address, and phone number."
+        );
+      }
+      if (product) {
+        await sendOrderAlert(senderId, product, messageText);
+      }
+      session.collectingDetails = false;
+      session.pendingOrderProduct = null;
+      session.state = "browsing";
+      addHistory(session, "assistant", "Order request sent");
       return replyInLanguage(session.lang,
-        "⚠️ দয়া করে নাম, ঠিকানা ও মোবাইল নাম্বার সঠিকভাবে লিখুন।",
-        "⚠️ Name, address, phone thik likhun.",
-        "⚠️ Please provide name, address, and phone number."
+        "⚠️ আপনার অর্ডার রিকোয়েস্ট seller এর কাছে পাঠানো হয়েছে। তিনি confirm করবেন এবং আপনার সাথে যোগাযোগ করবেন।",
+        "⚠️ Apnar order request seller er kache pathano hoyeche. Tini confirm korben ebong apnar sathe joggajog korben.",
+        "⚠️ Your order request has been sent. The seller will confirm it and contact you."
       );
     }
-    if (product) {
-      await sendOrderAlert(senderId, product, messageText);
-    }
-    session.collectingDetails = false;
-    session.pendingOrderProduct = null;
-    session.state = "browsing";
-    addHistory(session, "assistant", "Order request sent");
-    // FIX: removed "phone" from confirmation message
-    return replyInLanguage(session.lang,
-      "⚠️ আপনার অর্ডার রিকোয়েস্ট seller এর কাছে পাঠানো হয়েছে। তিনি confirm করবেন এবং আপনার সাথে যোগাযোগ করবেন।",
-      "⚠️ Apnar order request seller er kache pathano hoyeche. Tini confirm korben ebong apnar sathe joggajog korben.",
-      "⚠️ Your order request has been sent. The seller will confirm it and contact you."
-    );
   }
 
   // ----- SPECIAL INTENT: about seller -----
@@ -396,7 +397,7 @@ async function processMessage(senderId, messageText) {
   let product = findBestProduct(products, messageText);
 
   // SMART CONTEXT: "eta / this / order korbo" only if last assistant message was about product
-  const contextTriggers = /^(eta|this|ota|eita|same|that|ata|ta|eti|order korbo|ami nibo|ei ta)$/i;
+  const contextTriggers = /^(eta|this|ota|eita|same|that|ata|ta|eti|order korbo|ami nibo|ei ta|this one)$/i;
   const lastAssistantMsg = session.history.filter(h => h.role === "assistant").pop()?.message || "";
   const lastMentionsProduct = session.lastProduct && lastAssistantMsg.toLowerCase().includes(session.lastProduct.product_name.toLowerCase());
 
@@ -420,7 +421,6 @@ async function processMessage(senderId, messageText) {
     switch (intent) {
       case "price":
         addHistory(session, "assistant", `Price of ${name} answered`);
-        // FIX: use "price" instead of "dam" in Banglish
         return replyInLanguage(lang,
           `${name} এর দাম ${price} টাকা।`,
           `${name} er price ${price} taka.`,
@@ -452,7 +452,6 @@ async function processMessage(senderId, messageText) {
         );
       default:
         addHistory(session, "assistant", `Default product info for ${name}`);
-        // FIX: use "price" in Banglish default reply
         return replyInLanguage(lang,
           `${name} — দাম: ${price} টাকা, রং: ${color}${inStock ? ", এখন available।" : ", এখন নেই।"}`,
           `${name} — price: ${price} taka, color: ${color}${inStock ? ", ache." : ", nai."}`,
@@ -462,9 +461,8 @@ async function processMessage(senderId, messageText) {
   }
 
   // ----- NO PRODUCT MATCHED -----
-  // FIX: if order intent, try to use lastProduct directly
   if (intent === "order") {
-    // If we have a recent lastProduct, use it directly without asking again
+    // If we have a recent lastProduct, use it directly
     if (session.lastProduct) {
       session.collectingDetails = true;
       session.pendingOrderProduct = session.lastProduct;
@@ -537,12 +535,7 @@ app.post("/webhook", async (req, res) => {
           if (analysis.found) {
             reply = analysis.reply;
           } else {
-            const lang = detectLanguage(text);
-            reply = replyInLanguage(lang,
-              "এই ছবির প্রোডাক্টটি আমাদের শপে নেই। প্রোডাক্টের নাম বলুন।",
-              "Ei product amader shop e nai. Naam bolun.",
-              "This product is not in our shop. Please tell me the product name."
-            );
+            reply = analysis.reply || "Image not recognized. Please tell me the product name.";
           }
         } else if (text) {
           reply = await processMessage(senderId, text);
