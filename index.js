@@ -32,30 +32,26 @@ const ALERT_URL = `${BASE_URL}/api/public/order-alert`;
 const groq = GROQ_API_KEY ? new Groq({ apiKey: GROQ_API_KEY }) : null;
 
 /* ------------------- MEMORY ------------------- */
-const processedMessages = new Map(); // mid -> timestamp
+const processedMessages = new Map();
 const userCooldown = new Map();
 const userSessions = new Map();
 
-const MESSAGE_TTL = 60000;   // 1 min
+const MESSAGE_TTL = 60000;
 const COOLDOWN_MS = 800;
 const MAX_PROCESSED_MSGS = 5000;
 
 setInterval(() => {
   const now = Date.now();
-  // Clean old messages
   for (const [id, time] of processedMessages) {
     if (now - time > MESSAGE_TTL) processedMessages.delete(id);
   }
-  // Prevent memory leak: keep only last 5000
   if (processedMessages.size > MAX_PROCESSED_MSGS) {
     const firstKey = processedMessages.keys().next().value;
     processedMessages.delete(firstKey);
   }
-  // Clean cooldown
   for (const [id, time] of userCooldown) {
     if (now - time > MESSAGE_TTL) userCooldown.delete(id);
   }
-  // Clean inactive sessions
   for (const [id, session] of userSessions) {
     if (now - (session.lastActive || 0) > 3600000) userSessions.delete(id);
   }
@@ -67,8 +63,8 @@ function getSession(senderId) {
     userSessions.set(senderId, {
       lastProduct: null,
       lastIntent: null,
-      history: [],           // { role, message }[]
-      state: "browsing",     // browsing, product_viewed, collecting_info
+      history: [],
+      state: "browsing",
       collectingDetails: false,
       pendingOrderProduct: null,
       lang: "en",
@@ -217,10 +213,9 @@ Reply helpfully but without inventing product details.`,
   }
 }
 
-/* ------------------- IMAGE ANALYSIS with SAFE URL RESOLVE ------------------- */
+/* ------------------- IMAGE ANALYSIS ------------------- */
 async function resolveImageUrl(attachment) {
   if (attachment?.payload?.url) return attachment.payload.url;
-  // Facebook stickers or other non-image types
   return null;
 }
 
@@ -319,7 +314,6 @@ async function sendMessage(senderId, text, retry = 2) {
 }
 
 /* ------------------- MAIN PROCESSOR ------------------- */
-// Bonus: follow-up detection
 function isSimpleFollowUp(text) {
   return /^(ok|ঠিক আছে|yes|yes ok|k|kk|👍|thik ache|হ্যাঁ|ঠিক)$/i.test(text);
 }
@@ -337,11 +331,11 @@ async function processMessage(senderId, messageText) {
   const lang = detectLanguage(messageText);
   session.lang = lang;
 
-  // BONUS: simple follow-up after product info
+  // simple follow-up after product info
   if (session.state === "product_viewed" && isSimpleFollowUp(messageText) && session.lastProduct) {
     const reply = replyInLanguage(lang,
       `আপনি কি "${session.lastProduct.product_name}" নিয়ে কিছু জানতে চান? দাম, স্টক, অর্ডার বলতে পারেন।`,
-      `Apni ki "${session.lastProduct.product_name}" niye jante chan? Dam, stock, order bolte paren.`,
+      `Apni ki "${session.lastProduct.product_name}" niye jante chan? price, stock, order bolte paren.`,
       `Do you want to know more about "${session.lastProduct.product_name}"? Price, stock, or order?`
     );
     addHistory(session, "assistant", reply);
@@ -378,10 +372,11 @@ async function processMessage(senderId, messageText) {
     session.pendingOrderProduct = null;
     session.state = "browsing";
     addHistory(session, "assistant", "Order request sent");
+    // FIX: removed "phone" from confirmation message
     return replyInLanguage(session.lang,
-      "⚠️ আপনার অর্ডার রিকোয়েস্ট seller এর কাছে পাঠানো হয়েছে। তিনি ফোনে যোগাযোগ করে confirm করবেন।",
-      "⚠️ Apnar order request seller er kache pathano hoyeche. Tini phone e contact kore confirm korben.",
-      "⚠️ Your order request has been sent. The seller will contact you by phone to confirm."
+      "⚠️ আপনার অর্ডার রিকোয়েস্ট seller এর কাছে পাঠানো হয়েছে। তিনি confirm করবেন এবং আপনার সাথে যোগাযোগ করবেন।",
+      "⚠️ Apnar order request seller er kache pathano hoyeche. Tini confirm korben ebong apnar sathe joggajog korben.",
+      "⚠️ Your order request has been sent. The seller will confirm it and contact you."
     );
   }
 
@@ -390,9 +385,9 @@ async function processMessage(senderId, messageText) {
   if (intent === "about_seller") {
     addHistory(session, "assistant", "Answered seller info");
     return replyInLanguage(session.lang,
-      "আমরা একটি online store. Seller আপনার অর্ডার দেওয়ার পর ফোনে যোগাযোগ করবেন এবং confirm করবেন।",
-      "Amra ekta online store. Seller apnar order dewar por phone e contact kore confirm korben.",
-      "We are an online store. The seller will contact you by phone to confirm your order."
+      "আমরা একটি online store. Seller আপনার অর্ডার দেওয়ার পর confirm করবেন এবং আপনার সাথে যোগাযোগ করবেন।",
+      "Amra ekta online store. Seller apnar order dewar por confirm korben ebong apnar sathe joggajog korben.",
+      "We are an online store. The seller will confirm your order and contact you."
     );
   }
 
@@ -425,9 +420,10 @@ async function processMessage(senderId, messageText) {
     switch (intent) {
       case "price":
         addHistory(session, "assistant", `Price of ${name} answered`);
+        // FIX: use "price" instead of "dam" in Banglish
         return replyInLanguage(lang,
           `${name} এর দাম ${price} টাকা।`,
-          `${name} er dam ${price} taka.`,
+          `${name} er price ${price} taka.`,
           `${name} price is ${price} BDT.`
         );
       case "color":
@@ -450,22 +446,36 @@ async function processMessage(senderId, messageText) {
         session.state = "collecting_info";
         addHistory(session, "assistant", `Asked for details for ${name}`);
         return replyInLanguage(lang,
-          `🛒 "${name}" অর্ডার করতে চান।\n\nদয়া করে আপনার:\n• নাম\n• ঠিকানা\n• মোবাইল নাম্বার\n\nলিখুন। Seller যাচাই করে ফোনে confirm করবে।`,
-          `🛒 "${name}" order korte chan.\n\nPlease apnar:\n• Name\n• Address\n• Phone number\n\ndin. Seller verify kore phone e confirm korbe.`,
-          `🛒 You want to order "${name}".\n\nPlease provide:\n• Name\n• Address\n• Phone number\n\nThe seller will verify and confirm by phone.`
+          `🛒 "${name}" অর্ডার করতে চান।\n\nদয়া করে আপনার:\n• নাম\n• ঠিকানা\n• মোবাইল নাম্বার\n\nলিখুন। Seller আপনার তথ্য যাচাই করে confirm করবে।`,
+          `🛒 "${name}" order korte chan.\n\nPlease apnar:\n• Name\n• Address\n• Phone number\n\ndin. Seller verify kore confirm korbe.`,
+          `🛒 You want to order "${name}".\n\nPlease provide:\n• Name\n• Address\n• Phone number\n\nThe seller will verify and confirm your order.`
         );
       default:
         addHistory(session, "assistant", `Default product info for ${name}`);
+        // FIX: use "price" in Banglish default reply
         return replyInLanguage(lang,
           `${name} — দাম: ${price} টাকা, রং: ${color}${inStock ? ", এখন available।" : ", এখন নেই।"}`,
-          `${name} — dam: ${price} taka, color: ${color}${inStock ? ", ache." : ", nai."}`,
+          `${name} — price: ${price} taka, color: ${color}${inStock ? ", ache." : ", nai."}`,
           `${name} — Price: ${price} BDT, Color: ${color}${inStock ? ", in stock." : ", out of stock."}`
         );
     }
   }
 
-  // No product matched
+  // ----- NO PRODUCT MATCHED -----
+  // FIX: if order intent, try to use lastProduct directly
   if (intent === "order") {
+    // If we have a recent lastProduct, use it directly without asking again
+    if (session.lastProduct) {
+      session.collectingDetails = true;
+      session.pendingOrderProduct = session.lastProduct;
+      session.state = "collecting_info";
+      addHistory(session, "assistant", `Order flow started for ${session.lastProduct.product_name}`);
+      return replyInLanguage(lang,
+        `🛒 "${session.lastProduct.product_name}" অর্ডার করতে চান।\n\nদয়া করে আপনার:\n• নাম\n• ঠিকানা\n• মোবাইল নাম্বার\n\nলিখুন। Seller আপনার তথ্য যাচাই করে confirm করবে।`,
+        `🛒 "${session.lastProduct.product_name}" order korte chan.\n\nPlease apnar:\n• Name\n• Address\n• Phone number\n\ndin. Seller verify kore confirm korbe.`,
+        `🛒 You want to order "${session.lastProduct.product_name}".\n\nPlease provide:\n• Name\n• Address\n• Phone number\n\nThe seller will verify and confirm your order.`
+      );
+    }
     addHistory(session, "assistant", "Asked which product to order");
     return replyInLanguage(lang,
       "কোন প্রোডাক্ট অর্ডার করতে চান? প্রোডাক্টের নাম বলুন।",
@@ -473,6 +483,7 @@ async function processMessage(senderId, messageText) {
       "Which product would you like to order? Please tell me the product name."
     );
   }
+
   if (intent === "greeting") {
     addHistory(session, "assistant", "Greeted user");
     return replyInLanguage(lang,
@@ -510,7 +521,6 @@ app.post("/webhook", async (req, res) => {
         const text = event.message.text || "";
         const attachments = event.message.attachments;
 
-        // ATOMIC duplicate check (fix race condition)
         if (processedMessages.get(messageId)) continue;
         processedMessages.set(messageId, Date.now());
 
