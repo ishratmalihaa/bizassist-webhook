@@ -6,61 +6,60 @@ const app = express();
 app.use(express.json());
 
 /* ==================== CONFIG ==================== */
-const VERIFY_TOKEN    = process.env.VERIFY_TOKEN    || "bizassist123";
-const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN || "";  // fallback (optional)
-const WEBHOOK_API_KEY = process.env.WEBHOOK_API_KEY || "";
-const GROQ_API_KEY    = process.env.GROQ_API_KEY    || "";
-const FACEBOOK_APP_ID = process.env.FACEBOOK_APP_ID;
-const FACEBOOK_APP_SECRET = process.env.FACEBOOK_APP_SECRET;
+const VERIFY_TOKEN        = process.env.VERIFY_TOKEN        || "bizassist123";
+const WEBHOOK_API_KEY     = process.env.WEBHOOK_API_KEY     || "";
+const GROQ_API_KEY        = process.env.GROQ_API_KEY        || "";
+const FACEBOOK_APP_ID     = process.env.FACEBOOK_APP_ID     || "";
+const FACEBOOK_APP_SECRET = process.env.FACEBOOK_APP_SECRET || "";
 
-if (!PAGE_ACCESS_TOKEN) console.warn("⚠️ PAGE_ACCESS_TOKEN missing – will only work with connected pages");
-if (!WEBHOOK_API_KEY)   { console.error("❌ Missing WEBHOOK_API_KEY"); process.exit(1); }
-if (!GROQ_API_KEY)      console.warn("⚠️ GROQ_API_KEY missing – AI & image disabled");
-if (!FACEBOOK_APP_ID || !FACEBOOK_APP_SECRET) console.warn("⚠️ Facebook OAuth env vars missing – Connect button won't work");
+if (!WEBHOOK_API_KEY) { console.error("❌ Missing WEBHOOK_API_KEY"); process.exit(1); }
+if (!GROQ_API_KEY)    console.warn("⚠️ GROQ_API_KEY missing - AI disabled");
+if (!FACEBOOK_APP_ID || !FACEBOOK_APP_SECRET) console.warn("⚠️ Facebook OAuth not configured");
 
-const SELLER_ID   = process.env.SELLER_ID   || "67f55dc2-41e9-410c-8c6b-289ebee08118";
-const BASE_URL    = process.env.BASE_URL    || "https://project--b95f1c78-6680-4b45-b2e2-e1d1fbebf00d.lovable.app";
+const SELLER_ID    = process.env.SELLER_ID || "67f55dc2-41e9-410c-8c6b-289ebee08118";
+const BASE_URL     = "https://project--b95f1c78-6680-4b45-b2e2-e1d1fbebf00d.lovable.app";
 const PRODUCTS_URL = `${BASE_URL}/api/public/get-products`;
 const ALERT_URL    = `${BASE_URL}/api/public/order-alert`;
+const FRONTEND_URL = "https://talk-to-seller-ai.lovable.app";
 
 const groq = GROQ_API_KEY ? new Groq({ apiKey: GROQ_API_KEY }) : null;
 
-/* ==================== IN-MEMORY TOKEN STORAGE (multi‑user) ==================== */
-const pageTokens = new Map();        // page_id → page_access_token
-const sellerPages = new Map();       // seller_id → array of page_ids
+/* ==================== MULTI-USER TOKEN STORAGE ==================== */
+const pageTokens  = new Map(); // pageId → token
+const sellerPages = new Map(); // sellerId → [pageIds]
 
-async function savePageToken(sellerId, pageId, pageName, pageToken) {
-  pageTokens.set(pageId, pageToken);
+function savePageToken(sellerId, pageId, pageName, token) {
+  pageTokens.set(pageId, token);
   if (!sellerPages.has(sellerId)) sellerPages.set(sellerId, []);
-  sellerPages.get(sellerId).push(pageId);
-  console.log(`✅ Saved page: ${pageName} (${pageId}) for seller ${sellerId}`);
+  if (!sellerPages.get(sellerId).includes(pageId)) {
+    sellerPages.get(sellerId).push(pageId);
+  }
+  console.log(`✅ Saved: ${pageName} (${pageId}) for seller ${sellerId}`);
 }
 
-async function getPageToken(pageId) {
+function getPageToken(pageId) {
   return pageTokens.get(pageId) || null;
 }
 
-/* ==================== MEMORY & SESSION ==================== */
+/* ==================== MEMORY ==================== */
 const processedMessages = new Map();
 const userCooldown      = new Map();
 const userSessions      = new Map();
 
-const MESSAGE_TTL = 60000;
 const COOLDOWN_MS = 800;
 const SESSION_TTL = 3600000;
 
 setInterval(() => {
   const now = Date.now();
-  for (const [id, t] of processedMessages) if (now - t > MESSAGE_TTL) processedMessages.delete(id);
-  for (const [id, t] of userCooldown)      if (now - t > MESSAGE_TTL) userCooldown.delete(id);
+  for (const [id, t] of processedMessages) if (now - t > 60000) processedMessages.delete(id);
+  for (const [id, t] of userCooldown)      if (now - t > 60000) userCooldown.delete(id);
   for (const [id, s] of userSessions)      if (now - (s.lastActive||0) > SESSION_TTL) userSessions.delete(id);
 }, 30000);
 
-function getSession(senderId) {
-  if (!userSessions.has(senderId)) {
-    userSessions.set(senderId, {
+function getSession(id) {
+  if (!userSessions.has(id)) {
+    userSessions.set(id, {
       lastProduct: null,
-      lastIntent: null,
       history: [],
       state: "browsing",
       collectingDetails: false,
@@ -69,20 +68,20 @@ function getSession(senderId) {
       lastActive: Date.now(),
     });
   }
-  const sess = userSessions.get(senderId);
-  sess.lastActive = Date.now();
-  return sess;
+  const s = userSessions.get(id);
+  s.lastActive = Date.now();
+  return s;
 }
 
 function addHistory(session, role, content) {
   session.history.push({ role, content });
-  if (session.history.length > 20) session.history.shift();
+  if (session.history.length > 10) session.history.shift();
 }
 
 /* ==================== PRODUCT CACHE ==================== */
-let productCache   = { data: [], time: 0 };
-let fetchingLock   = null;
-const CACHE_TTL    = 30000;
+let productCache = { data: [], time: 0 };
+let fetchingLock = null;
+const CACHE_TTL  = 30000;
 
 async function fetchProducts() {
   if (fetchingLock) return fetchingLock;
@@ -95,8 +94,8 @@ async function fetchProducts() {
         timeout: 8000,
       });
       let data = [];
-      if (Array.isArray(res.data))              data = res.data;
-      else if (Array.isArray(res.data?.data))   data = res.data.data;
+      if (Array.isArray(res.data))                data = res.data;
+      else if (Array.isArray(res.data?.data))     data = res.data.data;
       else if (Array.isArray(res.data?.products)) data = res.data.products;
       if (data.length) productCache = { data, time: now };
       return data.length ? data : productCache.data;
@@ -115,7 +114,7 @@ function normalize(str) {
 
 function levenshtein(a, b) {
   const m = a.length, n = b.length;
-  const dp = Array.from({ length: m+1 }, (_, i) => Array.from({ length: n+1 }, (_, j) => i===0 ? j : j===0 ? i : 0));
+  const dp = Array.from({ length: m+1 }, (_, i) => Array.from({ length: n+1 }, (_, j) => i===0?j:j===0?i:0));
   for (let i = 1; i <= m; i++) for (let j = 1; j <= n; j++)
     dp[i][j] = a[i-1]===b[j-1] ? dp[i-1][j-1] : 1+Math.min(dp[i-1][j], dp[i][j-1], dp[i-1][j-1]);
   return dp[m][n];
@@ -135,14 +134,14 @@ function findBestProduct(products, query) {
       const nameWords = name.split(" ").filter(w => w.length > 1);
       let wordMatchScore = 0;
       for (const nw of nameWords) {
-        const bestWord = Math.max(...qWords.map(qw => {
+        const bw = Math.max(...qWords.map(qw => {
           if (qw === nw) return 1.0;
           if (qw.includes(nw) || nw.includes(qw)) return 0.85;
           const dist = levenshtein(qw, nw);
           const maxLen = Math.max(qw.length, nw.length);
           return maxLen > 0 ? Math.max(0, 1 - dist/maxLen) : 0;
         }), 0);
-        wordMatchScore += bestWord;
+        wordMatchScore += bw;
       }
       score = Math.max(score, nameWords.length ? wordMatchScore/nameWords.length : 0);
     }
@@ -151,21 +150,7 @@ function findBestProduct(products, query) {
   return bestScore >= 0.40 ? best : null;
 }
 
-/* ==================== INTENT & LANGUAGE ==================== */
-function detectIntent(text) {
-  const t = text.toLowerCase();
-  const scores = { price: 0, stock: 0, color: 0, order: 0, greeting: 0, help: 0, cancel: 0 };
-  if (/(price|dam|koto|দাম|কত|cost|how much|taka koto)/i.test(t))                             scores.price   += 3;
-  if (/(stock|ache|available|আছে|ase|in stock|do you have|pabo|পাবো)/i.test(t))               scores.stock   += 3;
-  if (/(color|colour|rong|রং|colours|colors|ki rong|কি রং)/i.test(t))                        scores.color   += 3;
-  if (/(order|buy|purchase|nibo|নেব|kinbo|কিনব|lagbe|লাগবে|i want|i need|nite chai|amr order|আমার অর্ডার)/i.test(t)) scores.order += 3;
-  if (/^(hi|hello|hey|হ্যালো|হাই|assalamualaikum|salam)$/i.test(t.trim()))                   scores.greeting += 3;
-  if (/(help|ki ache|product list|what do you have|show me|ki product|কি আছে)/i.test(t))      scores.help    += 2;
-  if (/(cancel|বাতিল|no thanks|nah)/i.test(t))                                               scores.cancel  += 2;
-  const top = Object.entries(scores).sort((a,b) => b[1]-a[1])[0];
-  return top[1] > 0 ? top[0] : "fallback";
-}
-
+/* ==================== LANGUAGE ==================== */
 function detectLanguage(text) {
   if (/[\u0980-\u09FF]/.test(text)) return "bn";
   if (/(koto|dam|ache|nai|ki|taka|nibo|rong|lagbe|ase|pabo|chai|bolun|nite|theke)/i.test(text)) return "bl";
@@ -173,27 +158,50 @@ function detectLanguage(text) {
 }
 
 function L(lang, bn, bl, en) {
-  if (lang === "bn") return bn;
-  if (lang === "bl") return bl;
-  return en;
+  return lang === "bn" ? bn : lang === "bl" ? bl : en;
 }
 
-/* ==================== AI FALLBACK ==================== */
-async function getAIReply(userMessage, session, products) {
-  if (!groq) return null;
+/* ==================== SMART AI (NO HARDCODED RESPONSES) ==================== */
+async function getSmartReply(userMessage, session, products) {
+  if (!groq) {
+    // Fallback without AI
+    return "দুঃখিত, আমি এখন AI ছাড়া চলছি। প্রোডাক্টের নাম বলুন বা 'list' লিখুন।";
+  }
+
   const catalogue = products.map(p =>
-    `• ${p.product_name} | ${p.price_bdt||"N/A"} BDT | Colors: ${p.color||"N/A"} | ${p.stock_availability==="in_stock"?"In Stock":"Out of Stock"}`
+    `${p.product_name} - ${p.price_bdt||"N/A"} BDT - Colors: ${p.color||"N/A"} - ${p.stock_availability==="in_stock"?"In Stock":"Out of Stock"}`
   ).join("\n");
+
+  const systemPrompt = `You are Mira, a friendly Bangladeshi shop assistant. You're helpful, warm, and natural - like a real person chatting on Messenger.
+
+STRICT RULES:
+1. Match the user's language EXACTLY (Bangla/Banglish/English)
+2. Be conversational and natural - NO robotic phrases like "order korte order likhun"
+3. If user asks about price, tell the price naturally
+4. If user asks about color, tell the color naturally
+5. If user wants to order, ask for their details (name, address, phone) in ONE message
+6. NEVER say "type order" or "likhun" - just guide them naturally
+7. Keep replies SHORT (1-2 sentences max)
+8. If asked about something not in the catalogue, say you don't have it and suggest similar products
+
+PRODUCTS IN STOCK:
+${catalogue}
+
+CONVERSATION CONTEXT:
+Last product: ${session.lastProduct?.product_name || "none"}
+User's state: ${session.state}`;
+
   const messages = [
-    { role: "system", content: `You are Mira, a warm shop assistant. Match user language. ONLY discuss products in catalogue:\n${catalogue}\nLast product: ${session.lastProduct?.product_name||"none"}` },
-    ...session.history.slice(-6).map(h => ({ role: h.role==="user"?"user":"assistant", content: h.content })),
+    { role: "system", content: systemPrompt },
+    ...session.history.slice(-6),
     { role: "user", content: userMessage },
   ];
+
   try {
     const resp = await groq.chat.completions.create({
       model: "llama-3.3-70b-versatile",
-      temperature: 0.45,
-      max_tokens: 200,
+      temperature: 0.5,
+      max_tokens: 180,
       messages,
     });
     return resp.choices[0].message.content.trim();
@@ -205,7 +213,7 @@ async function getAIReply(userMessage, session, products) {
 
 /* ==================== IMAGE ANALYSIS ==================== */
 async function analyzeImage(imageUrl, products) {
-  if (!groq) return { found: false, reply: null };
+  if (!groq) return { found: false, reply: "এই পণ্যটি আমাদের কাছে নেই। অন্য কিছু দেখতে চান? 😊" };
   try {
     const imgRes = await axios.get(imageUrl, {
       responseType: "arraybuffer",
@@ -213,7 +221,7 @@ async function analyzeImage(imageUrl, products) {
       headers: { "User-Agent": "Mozilla/5.0" },
     });
     const base64 = Buffer.from(imgRes.data).toString("base64");
-    const mimeType = (imgRes.headers["content-type"] || "image/jpeg").split(";")[0].trim();
+    const mimeType = (imgRes.headers["content-type"]||"image/jpeg").split(";")[0].trim();
     const productList = products.map(p => `- ${p.product_name}`).join("\n");
 
     const vision = await groq.chat.completions.create({
@@ -223,67 +231,53 @@ async function analyzeImage(imageUrl, products) {
         role: "user",
         content: [
           { type: "image_url", image_url: { url: `data:${mimeType};base64,${base64}` } },
-          { type: "text", text: `Our products:\n${productList}\n\nDoes this image match any product? Reply ONLY with product name or "NO_MATCH".` },
+          { type: "text", text: `Shop products:\n${productList}\n\nMatch this image to a product. Reply ONLY with exact product name or "NO_MATCH".` },
         ],
       }],
     });
 
     const answer = vision.choices[0].message.content.trim();
-    if (answer === "NO_MATCH" || !answer) return { found: false, reply: null };
+    if (!answer || answer === "NO_MATCH") return { found: false, reply: null };
 
     const matched = findBestProduct(products, answer);
     if (matched) {
       return {
         found: true,
         product: matched,
-        reply: `✅ Found it! *${matched.product_name}* — ${matched.price_bdt||"N/A"} BDT\nColors: ${matched.color||"N/A"} | ${matched.stock_availability==="in_stock"?"In Stock 🟢":"Out of Stock 🔴"}\n\nType "order" to buy!`,
+        reply: `✅ পেয়ে গেছি! ${matched.product_name}\n💰 ${matched.price_bdt||"N/A"} BDT\n🎨 ${matched.color||"N/A"}\n📦 ${matched.stock_availability==="in_stock"?"In Stock 🟢":"Out of Stock 🔴"}`,
       };
     }
     return { found: false, reply: null };
   } catch (err) {
-    console.error("Image analysis error:", err.message);
+    console.error("Image error:", err.message);
     return { found: false, reply: null };
   }
 }
 
 /* ==================== ORDER ALERT ==================== */
 async function sendOrderAlert(senderId, product, detailsText) {
-  const payload = {
-    secret: WEBHOOK_API_KEY,
-    seller_id: SELLER_ID,
-    customer_fb_id: senderId,
-    product_name: product.product_name,
-    message: `🧾 NEW ORDER REQUEST\nProduct: ${product.product_name}\nPrice: ${product.price_bdt||"N/A"} BDT\nCustomer: ${detailsText}\n\n⚠️ Seller must confirm before processing.`,
-  };
-  console.log("📦 Order alert payload:", JSON.stringify(payload));
   try {
-    const res = await axios.post(ALERT_URL, payload, {
+    await axios.post(ALERT_URL, {
+      secret: WEBHOOK_API_KEY,
+      seller_id: SELLER_ID,
+      customer_fb_id: senderId,
+      product_name: product.product_name,
+      message: `🧾 নতুন অর্ডার!\nProduct: ${product.product_name}\nPrice: ${product.price_bdt||"N/A"} BDT\nCustomer: ${detailsText}`,
+    }, {
       headers: { "Content-Type": "application/json", "x-api-key": WEBHOOK_API_KEY },
       timeout: 10000,
     });
-    console.log("✅ Order alert sent:", res.status);
+    console.log(`✅ Order alert sent: ${product.product_name}`);
   } catch (err) {
     console.error("Order alert failed:", err.response?.data || err.message);
   }
 }
 
-/* ==================== FACEBOOK HELPERS ==================== */
-async function sendTyping(senderId) {
-  try {
-    await axios.post("https://graph.facebook.com/v19.0/me/messages",
-      { recipient: { id: senderId }, sender_action: "typing_on" },
-      { params: { access_token: PAGE_ACCESS_TOKEN }, timeout: 3000 });
-  } catch {}
-}
-
-async function sendMessage(senderId, text, pageToken = null, retry = 2) {
-  const token = pageToken || PAGE_ACCESS_TOKEN;
-  if (!token) {
-    console.error("No token available to send message");
-    return;
-  }
-  let t = text;
+/* ==================== FACEBOOK SEND ==================== */
+async function sendMessage(senderId, text, token) {
+  if (!token) return console.error("No token to send message");
   const chunks = [];
+  let t = text;
   while (t.length > 1900) {
     const cut = t.lastIndexOf("\n", 1900);
     chunks.push(t.slice(0, cut > 0 ? cut : 1900));
@@ -296,24 +290,9 @@ async function sendMessage(senderId, text, pageToken = null, retry = 2) {
         { recipient: { id: senderId }, message: { text: chunk } },
         { params: { access_token: token }, timeout: 8000 });
     } catch (err) {
-      if (retry > 0) {
-        await new Promise(r => setTimeout(r, 1000));
-        return sendMessage(senderId, chunk, token, retry - 1);
-      }
       console.error("FB send error:", err.response?.data || err.message);
     }
   }
-}
-
-/* ==================== PRODUCT LIST ==================== */
-function buildProductList(products, lang) {
-  if (!products.length) return L(lang, "এখন কোনো প্রোডাক্ট নেই।", "Ekhon kono product nai.", "No products right now.");
-  const lines = products.map(p => `• ${p.product_name} — ${p.price_bdt||"N/A"} BDT ${p.stock_availability==="in_stock"?"🟢":"🔴"}`).join("\n");
-  return L(lang,
-    `আমাদের প্রোডাক্ট:\n\n${lines}\n\nকোনটি সম্পর্কে জানতে চান?`,
-    `Amader products:\n\n${lines}\n\nKonti niye jante chan?`,
-    `Our products:\n\n${lines}\n\nWhich one would you like?`
-  );
 }
 
 /* ==================== MAIN MESSAGE PROCESSOR ==================== */
@@ -324,177 +303,150 @@ async function processMessage(senderId, messageText) {
   addHistory(session, "user", messageText);
 
   const products = await fetchProducts();
-  const intent   = detectIntent(messageText);
-  session.lastIntent = intent;
 
-  // Order details collection state
+  // ORDER DETAILS COLLECTION
   if (session.collectingDetails) {
-    if (intent === "cancel" || /^(cancel|no|na|না|বাতিল)$/i.test(messageText.trim())) {
+    if (/^(cancel|no|na|না|বাতিল)$/i.test(messageText.trim())) {
       session.collectingDetails = false;
       session.pendingOrderProduct = null;
       session.state = "browsing";
-      const reply = L(lang, "❌ অর্ডার বাতিল করা হয়েছে।", "❌ Order cancel hoyeche.", "❌ Order cancelled.");
+      const reply = "❌ অর্ডার বাতিল করা হয়েছে।";
       addHistory(session, "assistant", reply);
       return reply;
     }
+
     const hasPhone = /(?:\+?88)?01[3-9]\d{8}/.test(messageText) || /\d{10,14}/.test(messageText);
     const hasWords = messageText.trim().split(/\s+/).length >= 3;
+
     if (!hasPhone || !hasWords) {
       return L(lang,
-        "⚠️ দয়া করে নাম, ঠিকানা এবং মোবাইল নাম্বার একসাথে দিন।\nযেমন: মালিহা, সিলেট, 01911413567",
-        "⚠️ Name, address, phone din ekti message e.\nJemon: Maliha, Sylhet, 01911413567",
-        "⚠️ Please send your name, address and phone number in one message.\nExample: Maliha, Sylhet, 01911413567"
+        "⚠️ নাম, ঠিকানা এবং মোবাইল নাম্বার একসাথে দিন। যেমন: মালিহা, সিলেট, 01911413567",
+        "⚠️ Name, address, phone ektu detail diye lekhen. Jemon: Maliha, Sylhet, 01911413567",
+        "⚠️ Please send name, address and phone together. Example: Maliha, Sylhet, 01911413567"
       );
     }
+
     const product = session.pendingOrderProduct;
     if (product) await sendOrderAlert(senderId, product, messageText);
+
     session.collectingDetails = false;
     session.pendingOrderProduct = null;
     session.state = "browsing";
+
     const reply = L(lang,
-      `✅ অর্ডার রিকোয়েস্ট পাঠানো হয়েছে!\n\n📦 প্রোডাক্ট: ${product.product_name}\n💰 দাম: ${product.price_bdt || "N/A"} BDT\n\nSeller আপনার সাথে যোগাযোগ করে confirm করবেন। ধন্যবাদ! 🙏`,
-      `✅ Order request pathano hoyeche!\n\n📦 Product: ${product.product_name}\n💰 Price: ${product.price_bdt || "N/A"} BDT\n\nSeller apnar sathe jogajog kore confirm korbe. Dhonnobad! 🙏`,
-      `✅ Order request sent!\n\n📦 Product: ${product.product_name}\n💰 Price: ${product.price_bdt || "N/A"} BDT\n\nThe seller will contact you to confirm. Thank you! 🙏`
+      `✅ অর্ডার পাঠানো হয়েছে!\n\n📦 ${product.product_name}\n💰 ${product.price_bdt||"N/A"} BDT\n\nSeller যোগাযোগ করবেন। ধন্যবাদ! 🙏`,
+      `✅ Order pathano hoyeche!\n\n📦 ${product.product_name}\n💰 ${product.price_bdt||"N/A"} BDT\n\nSeller jogajog korbe. Dhonnobad! 🙏`,
+      `✅ Order sent!\n\n📦 ${product.product_name}\n💰 ${product.price_bdt||"N/A"} BDT\n\nSeller will contact you. Thank you! 🙏`
     );
     addHistory(session, "assistant", reply);
     return reply;
   }
 
-  // Greeting
-  if (intent === "greeting") {
-    const reply = L(lang,
-      `হ্যালো! 👋 আমি Mira। "list" লিখুন সব প্রোডাক্ট দেখতে!`,
-      `Hello! 👋 Ami Mira. "list" likhun products dekhte!`,
-      `Hey! 👋 I'm Mira. Type "list" to see all products!`
-    );
-    addHistory(session, "assistant", reply);
-    return reply;
-  }
+  // CHECK IF USER WANTS TO ORDER A SPECIFIC PRODUCT
+  const product = findBestProduct(products, messageText);
+  const orderIntent = /(order|buy|nibo|নেব|kinbo|কিনব|nite chai|কিনতে চাই)/i.test(messageText);
 
-  // Product list
-  if (intent === "help" || /^(list|show|products|ki ache|সব|all|দেখাও)$/i.test(messageText.trim())) {
-    const reply = buildProductList(products, lang);
-    addHistory(session, "assistant", reply);
-    return reply;
-  }
-
-  // Product lookup
-  let product = findBestProduct(products, messageText);
-  const contextWords = /^(eta|this|ota|eita|same|that|ata|ta|ei ta|seta)$/i;
-  if (!product && session.lastProduct && contextWords.test(messageText.trim())) {
-    product = session.lastProduct;
-  }
-
-  if (product) {
+  if (product && orderIntent) {
+    session.collectingDetails = true;
+    session.pendingOrderProduct = product;
     session.lastProduct = product;
-    session.state = "product_viewed";
-    const { product_name: name, price_bdt: price = "N/A", color = "N/A" } = product;
-    const inStock  = product.stock_availability === "in_stock";
-    const stockTxt = inStock ? "🟢 In Stock" : "🔴 Out of Stock";
-
-    if (intent === "order") {
-      session.collectingDetails    = true;
-      session.pendingOrderProduct  = product;
-      session.state                = "collecting_info";
-      const reply = L(lang,
-        `🛒 "${name}" অর্ডার করতে এক message এ দিন:\n• নাম\n• ঠিকানা\n• মোবাইল নাম্বার\n\nবাতিল করতে "cancel" লিখুন।`,
-        `🛒 "${name}" order er jonno ek message e din:\n• Name\n• Address\n• Phone\n\nCancel korte "cancel" likhun.`,
-        `🛒 To order "${name}", send one message with:\n• Name\n• Address\n• Phone number\n\nType "cancel" to cancel.`
-      );
-      addHistory(session, "assistant", reply);
-      return reply;
-    }
-
-    let reply;
-    switch (intent) {
-      case "price":
-        reply = L(lang,
-          `${name} এর দাম ${price} টাকা।${inStock?" এখন available! 🟢":""}`,
-          `${name} er price ${price} taka.${inStock?" Ekhon available! 🟢":""}`,
-          `${name} costs ${price} BDT.${inStock?" In stock! 🟢":""}`
-        ); break;
-      case "color":
-        reply = L(lang, `${name} এর রং: ${color}`, `${name} er colors: ${color}`, `${name} colors: ${color}`);
-        break;
-      case "stock":
-        reply = L(lang,
-          inStock?`হ্যাঁ! ${name} আছে। 🟢 দাম: ${price} টাকা।`:`দুঃখিত, ${name} নেই। 🔴`,
-          inStock?`Ha! ${name} ache. 🟢 Price: ${price} taka.`:`Sorry, ${name} nai. 🔴`,
-          inStock?`Yes! ${name} in stock. 🟢 Price: ${price} BDT.`:`Sorry, ${name} out of stock. 🔴`
-        ); break;
-      default:
-        reply = L(lang,
-          `*${name}*\n💰 ${price} টাকা\n🎨 ${color}\n📦 ${stockTxt}\n\nঅর্ডার করতে "order" লিখুন!`,
-          `*${name}*\n💰 ${price} taka\n🎨 ${color}\n📦 ${stockTxt}\n\nOrder korte "order" likhun!`,
-          `*${name}*\n💰 ${price} BDT\n🎨 ${color}\n📦 ${stockTxt}\n\nType "order" to buy!`
-        );
-    }
-    addHistory(session, "assistant", reply);
-    return reply;
-  }
-
-  // Order without product
-  if (intent === "order") {
+    session.state = "collecting_info";
     const reply = L(lang,
-      "কোন প্রোডাক্ট অর্ডার করতে চান? “list” লিখে সব দেখুন।",
-      "Kon product order korte chan? “list” likhe dekhte paren?",
-      "Which product would you like to order? Type “list” to see all."
+      `🛒 ${product.product_name} অর্ডার করতে এক message এ দিন:\n• নাম\n• ঠিকানা\n• মোবাইল নাম্বার`,
+      `🛒 ${product.product_name} order er jonno ek message e din:\n• Name\n• Address\n• Phone`,
+      `🛒 To order ${product.product_name}, send:\n• Name\n• Address\n• Phone`
     );
     addHistory(session, "assistant", reply);
     return reply;
   }
 
-  // AI fallback
-  const aiReply = await getAIReply(messageText, session, products);
-  if (aiReply) {
-    addHistory(session, "assistant", aiReply);
-    return aiReply;
+  // LET AI HANDLE EVERYTHING ELSE
+  const reply = await getSmartReply(messageText, session, products);
+  if (reply) {
+    addHistory(session, "assistant", reply);
+    
+    // Update last product if AI mentioned one
+    if (product) {
+      session.lastProduct = product;
+      session.state = "product_viewed";
+    }
+    
+    return reply;
   }
 
-  const fallback = L(lang,
-    "একটু বুঝতে পারিনি! কোন প্রোডাক্ট সম্পর্কে জানতে চান? 😊",
-    "Ektu bujhte parini! Kon product somproke jante chan? 😊",
-    "I didn't quite get that! Which product would you like to know about? 😊"
-  );
-  addHistory(session, "assistant", fallback);
-  return fallback;
+  return "একটু বুঝতে পারিনি! কোন প্রোডাক্ট চান? 😊";
 }
 
-/* ==================== FACEBOOK OAUTH CALLBACK ==================== */
+/* ==================== FACEBOOK OAUTH ==================== */
+app.get("/auth/facebook", (req, res) => {
+  const { seller_id } = req.query;
+  if (!seller_id) return res.status(400).send("Missing seller_id");
+  
+  const redirectUri = `${req.protocol}://${req.get('host')}/auth/facebook/callback`;
+  const state = seller_id; // Use seller_id as state
+  const fbAuthUrl = `https://www.facebook.com/v19.0/dialog/oauth?client_id=${FACEBOOK_APP_ID}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=pages_show_list,pages_messaging,pages_read_engagement&state=${state}`;
+  
+  res.redirect(fbAuthUrl);
+});
+
 app.get("/auth/facebook/callback", async (req, res) => {
   const { code, state } = req.query;
+  
   if (!code || !state) {
-    console.error("Missing code or state in callback");
-    return res.redirect("https://talk-to-seller-ai.lovable.app/integrations?error=missing");
+    console.error("❌ Missing code or state");
+    return res.redirect(`${FRONTEND_URL}/integrations?error=missing_params`);
   }
 
   try {
-    // Exchange code for user access token
+    const redirectUri = `${req.protocol}://${req.get('host')}/auth/facebook/callback`;
+    
+    // Exchange code for token
     const tokenRes = await axios.get("https://graph.facebook.com/v19.0/oauth/access_token", {
       params: {
         client_id: FACEBOOK_APP_ID,
         client_secret: FACEBOOK_APP_SECRET,
-        redirect_uri: "https://talk-to-seller-ai.lovable.app/integrations",
+        redirect_uri: redirectUri,
         code,
       },
     });
-    const userToken = tokenRes.data.access_token;
 
-    // Get user's pages
+    const userToken = tokenRes.data.access_token;
+    console.log("✅ Got user token");
+
+    // Get pages
     const pagesRes = await axios.get("https://graph.facebook.com/v19.0/me/accounts", {
       params: { access_token: userToken },
     });
-    const pages = pagesRes.data.data;
 
-    // Save each page to memory
-    for (const page of pages) {
-      await savePageToken(state, page.id, page.name, page.access_token);
+    if (!pagesRes.data.data || !pagesRes.data.data.length) {
+      return res.redirect(`${FRONTEND_URL}/integrations?error=no_pages`);
     }
 
-    res.redirect("https://talk-to-seller-ai.lovable.app/integrations?success=true");
+    const sellerId = state; // seller_id from state
+    
+    // Save all pages
+    for (const page of pagesRes.data.data) {
+      savePageToken(sellerId, page.id, page.name, page.access_token);
+      
+      // Subscribe page to webhook
+      try {
+        await axios.post(`https://graph.facebook.com/v19.0/${page.id}/subscribed_apps`, {
+          subscribed_fields: "messages,messaging_postbacks",
+        }, {
+          params: { access_token: page.access_token },
+        });
+        console.log(`✅ Subscribed: ${page.name}`);
+      } catch (subErr) {
+        console.error(`❌ Subscribe failed for ${page.name}:`, subErr.message);
+      }
+    }
+
+    const firstPage = pagesRes.data.data[0];
+    res.redirect(`${FRONTEND_URL}/integrations?success=true&page_name=${encodeURIComponent(firstPage.name)}&page_count=${pagesRes.data.data.length}`);
+
   } catch (err) {
-    console.error("OAuth error:", err.response?.data || err.message);
-    res.redirect("https://talk-to-seller-ai.lovable.app/integrations?error=auth_failed");
+    console.error("❌ OAuth error:", err.response?.data || err.message);
+    res.redirect(`${FRONTEND_URL}/integrations?error=auth_failed`);
   }
 });
 
@@ -512,11 +464,11 @@ app.post("/webhook", async (req, res) => {
       for (const event of entry.messaging || []) {
         if (!event.message || event.message.is_echo) continue;
 
-        const senderId   = event.sender.id;
-        const messageId  = event.message.mid;
-        const text       = event.message.text?.trim() || "";
+        const senderId    = event.sender.id;
+        const messageId   = event.message.mid;
+        const text        = event.message.text?.trim() || "";
         const attachments = event.message.attachments;
-        const pageId     = entry.id;   // Facebook page that received the message
+        const pageId      = entry.id;
 
         if (processedMessages.has(messageId)) continue;
         processedMessages.set(messageId, Date.now());
@@ -525,26 +477,25 @@ app.post("/webhook", async (req, res) => {
         if (Date.now() - lastTime < COOLDOWN_MS) continue;
         userCooldown.set(senderId, Date.now());
 
-        sendTyping(senderId);
         let reply = "";
 
-        // Image handling
+        // IMAGE
         if (attachments?.length && attachments[0].type === "image") {
           const products = await fetchProducts();
           const imageUrl = attachments[0].payload.url;
           const analysis = await analyzeImage(imageUrl, products);
+          
+          const session = getSession(senderId);
           if (analysis.found) {
             reply = analysis.reply;
-            const sess = getSession(senderId);
-            sess.lastProduct = analysis.product;
-            sess.state = "product_viewed";
-            addHistory(sess, "assistant", reply);
+            session.lastProduct = analysis.product;
+            session.state = "product_viewed";
+            addHistory(session, "assistant", reply);
           } else {
-            const sess = getSession(senderId);
-            reply = L(sess.lang,
+            reply = analysis.reply || L(session.lang,
               "এই পণ্যটি আমাদের কাছে নেই। অন্য কিছু দেখতে চান? 😊",
               "Ei pọnno amader kache nai. Onno kisu dekhte chan? 😊",
-              "This product isn't in our shop. Would you like to see something else? 😊"
+              "This isn't in our shop. Want to see something else? 😊"
             );
           }
         } else if (text) {
@@ -552,12 +503,11 @@ app.post("/webhook", async (req, res) => {
         }
 
         if (reply) {
-          // Get the page-specific token (from memory) or fallback to global
-          const token = await getPageToken(pageId) || PAGE_ACCESS_TOKEN;
+          const token = getPageToken(pageId);
           if (token) {
             await sendMessage(senderId, reply, token);
           } else {
-            console.error(`No token available for page ${pageId}`);
+            console.error(`❌ No token for page ${pageId}`);
           }
         }
       }
@@ -568,12 +518,12 @@ app.post("/webhook", async (req, res) => {
 });
 
 app.get("/", (req, res) => res.json({
-  status: "✅ BizAssist v4.0 (Multi‑User in‑memory)",
+  status: "✅ BizAssist Smart Bot v5.0",
   uptime: process.uptime(),
-  cached_products: productCache.data.length,
-  active_sessions: userSessions.size,
-  connected_pages: pageTokens.size,
+  products: productCache.data.length,
+  sessions: userSessions.size,
+  pages: pageTokens.size,
 }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 BizAssist v4.0 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Smart Bot v5.0 on port ${PORT}`));
