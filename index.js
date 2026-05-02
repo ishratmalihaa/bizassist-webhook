@@ -29,13 +29,12 @@ const pageTokens  = new Map(); // pageId → token
 const sellerPages = new Map(); // sellerId → [pageIds]
 
 async function savePageToken(sellerId, pageId, pageName, token) {
-  // Save in memory (for current session)
+  // Save in memory
   pageTokens.set(pageId, token);
   if (!sellerPages.has(sellerId)) sellerPages.set(sellerId, []);
   if (!sellerPages.get(sellerId).includes(pageId)) {
     sellerPages.get(sellerId).push(pageId);
   }
-  
   console.log(`✅ Saved to memory: ${pageName} (${pageId}) for seller ${sellerId}`);
   
   // Save to database (persistent)
@@ -69,12 +68,17 @@ async function getPageToken(pageId) {
       timeout: 8000,
     });
     
-    // Find the seller with matching page_id
-    const sellers = res.data || [];
-    const seller = sellers.find(s => s.page_id === pageId);
+    // Safely extract array from response
+    let sellers = [];
+    if (Array.isArray(res.data)) sellers = res.data;
+    else if (res.data && typeof res.data === "object") {
+      if (Array.isArray(res.data.sellers)) sellers = res.data.sellers;
+      else if (Array.isArray(res.data.data)) sellers = res.data.data;
+      else sellers = Object.values(res.data);
+    }
     
+    const seller = sellers.find(s => s.page_id === pageId);
     if (seller?.page_access_token) {
-      // Save to memory for faster access
       pageTokens.set(pageId, seller.page_access_token);
       console.log(`✅ Loaded token from DB for page ${pageId}`);
       return seller.page_access_token;
@@ -82,11 +86,9 @@ async function getPageToken(pageId) {
   } catch (err) {
     console.error("❌ Failed to fetch token from DB:", err.response?.data || err.message);
   }
-  
   return null;
 }
 
-/* ==================== LOAD ALL TOKENS ON STARTUP ==================== */
 async function loadAllTokensFromDB() {
   try {
     console.log("🔄 Loading tokens from database...");
@@ -95,28 +97,29 @@ async function loadAllTokensFromDB() {
       timeout: 10000,
     });
     
-    const sellers = res.data || [];
-    let loaded = 0;
+    // Safely convert response to array
+    let sellers = [];
+    if (Array.isArray(res.data)) sellers = res.data;
+    else if (res.data && typeof res.data === "object") {
+      if (Array.isArray(res.data.sellers)) sellers = res.data.sellers;
+      else if (Array.isArray(res.data.data)) sellers = res.data.data;
+      else sellers = Object.values(res.data);
+    }
     
+    let loaded = 0;
     for (const seller of sellers) {
       if (seller.page_id && seller.page_access_token) {
         pageTokens.set(seller.page_id, seller.page_access_token);
-        
-        if (!sellerPages.has(seller.seller_id)) {
-          sellerPages.set(seller.seller_id, []);
-        }
+        if (!sellerPages.has(seller.seller_id)) sellerPages.set(seller.seller_id, []);
         if (!sellerPages.get(seller.seller_id).includes(seller.page_id)) {
           sellerPages.get(seller.seller_id).push(seller.page_id);
         }
-        
         loaded++;
-        console.log(`  ✓ Loaded token for page ${seller.page_id} (seller: ${seller.seller_id})`);
       }
     }
-    
     console.log(`✅ Loaded ${loaded} page tokens from database`);
   } catch (err) {
-    console.error("❌ Failed to load tokens from DB:", err.response?.data || err.message);
+    console.error("❌ Failed to load tokens from DB:", err.message);
   }
 }
 
@@ -240,7 +243,7 @@ function L(lang, bn, bl, en) {
   return lang === "bn" ? bn : lang === "bl" ? bl : en;
 }
 
-/* ==================== SMART AI (NO HARDCODED RESPONSES) ==================== */
+/* ==================== SMART AI ==================== */
 async function getSmartReply(userMessage, session, products) {
   if (!groq) {
     return "দুঃখিত, আমি এখন AI ছাড়া চলছি। প্রোডাক্টের নাম বলুন বা 'list' লিখুন।";
@@ -250,24 +253,17 @@ async function getSmartReply(userMessage, session, products) {
     `${p.product_name} - ${p.price_bdt||"N/A"} BDT - Colors: ${p.color||"N/A"} - ${p.stock_availability==="in_stock"?"In Stock":"Out of Stock"}`
   ).join("\n");
 
-  const systemPrompt = `You are Mira, a friendly Bangladeshi shop assistant. You're helpful, warm, and natural - like a real person chatting on Messenger.
+  const systemPrompt = `You are Mira, a friendly Bangladeshi shop assistant. You're helpful, warm, and natural.
 
 STRICT RULES:
-1. Match the user's language EXACTLY (Bangla/Banglish/English)
-2. Be conversational and natural - NO robotic phrases like "order korte order likhun"
-3. If user asks about price, tell the price naturally
-4. If user asks about color, tell the color naturally
-5. If user wants to order, ask for their details (name, address, phone) in ONE message
-6. NEVER say "type order" or "likhun" - just guide them naturally
-7. Keep replies SHORT (1-2 sentences max)
-8. If asked about something not in the catalogue, say you don't have it and suggest similar products
+1. Match user language (Bangla/Banglish/English)
+2. Be conversational – NEVER say "order korte order likhun"
+3. If user asks price/color/stock, answer directly
+4. If user wants to order, ask for name, address, phone in ONE message
+5. Keep replies short (1-2 sentences)
+6. If product not in catalogue, say so and suggest similar
 
-PRODUCTS IN STOCK:
-${catalogue}
-
-CONVERSATION CONTEXT:
-Last product: ${session.lastProduct?.product_name || "none"}
-User's state: ${session.state}`;
+PRODUCTS:\n${catalogue}\nLast product: ${session.lastProduct?.product_name || "none"}`;
 
   const messages = [
     { role: "system", content: systemPrompt },
@@ -309,7 +305,7 @@ async function analyzeImage(imageUrl, products) {
         role: "user",
         content: [
           { type: "image_url", image_url: { url: `data:${mimeType};base64,${base64}` } },
-          { type: "text", text: `Shop products:\n${productList}\n\nMatch this image to a product. Reply ONLY with exact product name or "NO_MATCH".` },
+          { type: "text", text: `Shop products:\n${productList}\n\nMatch this image. Reply ONLY with product name or "NO_MATCH".` },
         ],
       }],
     });
@@ -353,11 +349,7 @@ async function sendOrderAlert(senderId, product, detailsText) {
 
 /* ==================== FACEBOOK SEND ==================== */
 async function sendMessage(senderId, text, token) {
-  if (!token) {
-    console.error(`❌ No token to send message to ${senderId}`);
-    return;
-  }
-  
+  if (!token) return console.error(`❌ No token for ${senderId}`);
   const chunks = [];
   let t = text;
   while (t.length > 1900) {
@@ -366,7 +358,6 @@ async function sendMessage(senderId, text, token) {
     t = t.slice(cut > 0 ? cut : 1900).trim();
   }
   if (t.length) chunks.push(t);
-  
   for (const chunk of chunks) {
     try {
       await axios.post("https://graph.facebook.com/v19.0/me/messages",
@@ -387,25 +378,23 @@ async function processMessage(senderId, messageText) {
 
   const products = await fetchProducts();
 
-  // ORDER DETAILS COLLECTION
   if (session.collectingDetails) {
     if (/^(cancel|no|na|না|বাতিল)$/i.test(messageText.trim())) {
       session.collectingDetails = false;
       session.pendingOrderProduct = null;
       session.state = "browsing";
-      const reply = "❌ অর্ডার বাতিল করা হয়েছে।";
+      const reply = "❌ অর্ডার বাতিল।";
       addHistory(session, "assistant", reply);
       return reply;
     }
 
     const hasPhone = /(?:\+?88)?01[3-9]\d{8}/.test(messageText) || /\d{10,14}/.test(messageText);
     const hasWords = messageText.trim().split(/\s+/).length >= 3;
-
     if (!hasPhone || !hasWords) {
       return L(lang,
         "⚠️ নাম, ঠিকানা এবং মোবাইল নাম্বার একসাথে দিন। যেমন: মালিহা, সিলেট, 01911413567",
-        "⚠️ Name, address, phone ektu detail diye lekhen. Jemon: Maliha, Sylhet, 01911413567",
-        "⚠️ Please send name, address and phone together. Example: Maliha, Sylhet, 01911413567"
+        "⚠️ Name, address, phone together. Example: Maliha, Sylhet, 01911413567",
+        "⚠️ Send name, address, phone together. Example: Maliha, Sylhet, 01911413567"
       );
     }
 
@@ -417,15 +406,14 @@ async function processMessage(senderId, messageText) {
     session.state = "browsing";
 
     const reply = L(lang,
-      `✅ অর্ডার পাঠানো হয়েছে!\n\n📦 ${product.product_name}\n💰 ${product.price_bdt||"N/A"} BDT\n\nSeller যোগাযোগ করবেন। ধন্যবাদ! 🙏`,
-      `✅ Order pathano hoyeche!\n\n📦 ${product.product_name}\n💰 ${product.price_bdt||"N/A"} BDT\n\nSeller jogajog korbe. Dhonnobad! 🙏`,
-      `✅ Order sent!\n\n📦 ${product.product_name}\n💰 ${product.price_bdt||"N/A"} BDT\n\nSeller will contact you. Thank you! 🙏`
+      `✅ অর্ডার পাঠানো হয়েছে!\n📦 ${product.product_name}\n💰 ${product.price_bdt||"N/A"} BDT\nSeller যোগাযোগ করবেন।`,
+      `✅ Order pathano hoyeche!\n📦 ${product.product_name}\n💰 ${product.price_bdt||"N/A"} BDT\nSeller contact korbe.`,
+      `✅ Order sent!\n📦 ${product.product_name}\n💰 ${product.price_bdt||"N/A"} BDT\nSeller will contact you.`
     );
     addHistory(session, "assistant", reply);
     return reply;
   }
 
-  // CHECK IF USER WANTS TO ORDER A SPECIFIC PRODUCT
   const product = findBestProduct(products, messageText);
   const orderIntent = /(order|buy|nibo|নেব|kinbo|কিনব|nite chai|কিনতে চাই)/i.test(messageText);
 
@@ -436,27 +424,19 @@ async function processMessage(senderId, messageText) {
     session.state = "collecting_info";
     const reply = L(lang,
       `🛒 ${product.product_name} অর্ডার করতে এক message এ দিন:\n• নাম\n• ঠিকানা\n• মোবাইল নাম্বার`,
-      `🛒 ${product.product_name} order er jonno ek message e din:\n• Name\n• Address\n• Phone`,
+      `🛒 ${product.product_name} order er jonno ek message din:\n• Name\n• Address\n• Phone`,
       `🛒 To order ${product.product_name}, send:\n• Name\n• Address\n• Phone`
     );
     addHistory(session, "assistant", reply);
     return reply;
   }
 
-  // LET AI HANDLE EVERYTHING ELSE
   const reply = await getSmartReply(messageText, session, products);
   if (reply) {
     addHistory(session, "assistant", reply);
-    
-    // Update last product if AI mentioned one
-    if (product) {
-      session.lastProduct = product;
-      session.state = "product_viewed";
-    }
-    
+    if (product) { session.lastProduct = product; session.state = "product_viewed"; }
     return reply;
   }
-
   return "একটু বুঝতে পারিনি! কোন প্রোডাক্ট চান? 😊";
 }
 
@@ -464,79 +444,43 @@ async function processMessage(senderId, messageText) {
 app.get("/auth/facebook", (req, res) => {
   const { seller_id } = req.query;
   if (!seller_id) return res.status(400).send("Missing seller_id");
-  
   const redirectUri = `${req.protocol}://${req.get('host')}/auth/facebook/callback`;
   const state = seller_id;
   const fbAuthUrl = `https://www.facebook.com/v19.0/dialog/oauth?client_id=${FACEBOOK_APP_ID}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=pages_show_list,pages_messaging,pages_read_engagement&state=${state}`;
-  
   res.redirect(fbAuthUrl);
 });
 
 app.get("/auth/facebook/callback", async (req, res) => {
   const { code, state } = req.query;
-  
-  if (!code || !state) {
-    console.error("❌ Missing code or state");
-    return res.redirect(`${FRONTEND_URL}/integrations?error=missing_params`);
-  }
-
+  if (!code || !state) return res.redirect(`${FRONTEND_URL}/integrations?error=missing_params`);
   try {
     const redirectUri = `${req.protocol}://${req.get('host')}/auth/facebook/callback`;
-    
-    // Exchange code for token
     const tokenRes = await axios.get("https://graph.facebook.com/v19.0/oauth/access_token", {
-      params: {
-        client_id: FACEBOOK_APP_ID,
-        client_secret: FACEBOOK_APP_SECRET,
-        redirect_uri: redirectUri,
-        code,
-      },
+      params: { client_id: FACEBOOK_APP_ID, client_secret: FACEBOOK_APP_SECRET, redirect_uri: redirectUri, code },
     });
-
     const userToken = tokenRes.data.access_token;
-    console.log("✅ Got user token");
-
-    // Get pages
     const pagesRes = await axios.get("https://graph.facebook.com/v19.0/me/accounts", {
       params: { access_token: userToken },
     });
-
-    if (!pagesRes.data.data || !pagesRes.data.data.length) {
-      return res.redirect(`${FRONTEND_URL}/integrations?error=no_pages`);
-    }
-
+    if (!pagesRes.data.data || !pagesRes.data.data.length) return res.redirect(`${FRONTEND_URL}/integrations?error=no_pages`);
     const sellerId = state;
-    
-    // Save all pages
     for (const page of pagesRes.data.data) {
       await savePageToken(sellerId, page.id, page.name, page.access_token);
-      
-      // Subscribe page to webhook
-      try {
-        await axios.post(`https://graph.facebook.com/v19.0/${page.id}/subscribed_apps`, {
-          subscribed_fields: "messages,messaging_postbacks",
-        }, {
-          params: { access_token: page.access_token },
-        });
-        console.log(`✅ Subscribed: ${page.name}`);
-      } catch (subErr) {
-        console.error(`❌ Subscribe failed for ${page.name}:`, subErr.message);
-      }
+      await axios.post(`https://graph.facebook.com/v19.0/${page.id}/subscribed_apps`, {
+        subscribed_fields: "messages,messaging_postbacks",
+      }, { params: { access_token: page.access_token } }).catch(e => console.error(`Subscribe error: ${e.message}`));
     }
-
     const firstPage = pagesRes.data.data[0];
-    res.redirect(`${FRONTEND_URL}/integrations?success=true&page_name=${encodeURIComponent(firstPage.name)}&page_count=${pagesRes.data.data.length}`);
-
+    res.redirect(`${FRONTEND_URL}/integrations?success=true&page_name=${encodeURIComponent(firstPage.name)}`);
   } catch (err) {
-    console.error("❌ OAuth error:", err.response?.data || err.message);
+    console.error("OAuth error:", err.message);
     res.redirect(`${FRONTEND_URL}/integrations?error=auth_failed`);
   }
 });
 
 /* ==================== WEBHOOK ==================== */
 app.get("/webhook", (req, res) => {
-  if (req.query["hub.verify_token"] === VERIFY_TOKEN)
-    return res.send(req.query["hub.challenge"]);
+  if (req.query["hub.verify_token"] === VERIFY_TOKEN) return res.send(req.query["hub.challenge"]);
   res.sendStatus(403);
 });
 
@@ -546,28 +490,20 @@ app.post("/webhook", async (req, res) => {
     for (const entry of req.body.entry || []) {
       for (const event of entry.messaging || []) {
         if (!event.message || event.message.is_echo) continue;
-
-        const senderId    = event.sender.id;
-        const messageId   = event.message.mid;
-        const text        = event.message.text?.trim() || "";
+        const senderId = event.sender.id;
+        const messageId = event.message.mid;
+        const text = event.message.text?.trim() || "";
         const attachments = event.message.attachments;
-        const pageId      = entry.id;
-
+        const pageId = entry.id;
         if (processedMessages.has(messageId)) continue;
         processedMessages.set(messageId, Date.now());
-
         const lastTime = userCooldown.get(senderId) || 0;
         if (Date.now() - lastTime < COOLDOWN_MS) continue;
         userCooldown.set(senderId, Date.now());
-
         let reply = "";
-
-        // IMAGE
         if (attachments?.length && attachments[0].type === "image") {
           const products = await fetchProducts();
-          const imageUrl = attachments[0].payload.url;
-          const analysis = await analyzeImage(imageUrl, products);
-          
+          const analysis = await analyzeImage(attachments[0].payload.url, products);
           const session = getSession(senderId);
           if (analysis.found) {
             reply = analysis.reply;
@@ -575,41 +511,27 @@ app.post("/webhook", async (req, res) => {
             session.state = "product_viewed";
             addHistory(session, "assistant", reply);
           } else {
-            reply = analysis.reply || L(session.lang,
-              "এই পণ্যটি আমাদের কাছে নেই। অন্য কিছু দেখতে চান? 😊",
-              "Ei ponno amader kache nai. Onno kisu dekhte chan? 😊",
-              "This isn't in our shop. Want to see something else? 😊"
-            );
+            reply = analysis.reply || L(session.lang, "এই পণ্যটি আমাদের কাছে নেই। অন্য কিছু দেখতে চান? 😊", "Ei pọnno nai. Onno kisu dekhte chan?", "This isn't in our shop. Want to see something else?");
           }
         } else if (text) {
           reply = await processMessage(senderId, text);
         }
-
         if (reply) {
           const token = await getPageToken(pageId);
-          if (token) {
-            await sendMessage(senderId, reply, token);
-          } else {
-            console.error(`❌ No token for page ${pageId} - user may need to reconnect`);
-          }
+          if (token) await sendMessage(senderId, reply, token);
+          else console.error(`❌ No token for page ${pageId}`);
         }
       }
     }
   } catch (err) {
-    console.error("Webhook error:", err.message, err.stack);
+    console.error("Webhook error:", err.message);
   }
 });
 
-app.get("/", (req, res) => res.json({
-  status: "✅ BizAssist Smart Bot v6.0 (Persistent Tokens)",
-  uptime: process.uptime(),
-  products: productCache.data.length,
-  sessions: userSessions.size,
-  pages: pageTokens.size,
-}));
+app.get("/", (req, res) => res.json({ status: "✅ BizAssist v6.1", uptime: process.uptime() }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`🚀 Smart Bot v6.0 on port ${PORT}`);
+  console.log(`🚀 Smart Bot v6.1 on port ${PORT}`);
   await loadAllTokensFromDB();
 });
