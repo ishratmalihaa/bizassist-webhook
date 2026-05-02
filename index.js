@@ -28,17 +28,96 @@ const groq = GROQ_API_KEY ? new Groq({ apiKey: GROQ_API_KEY }) : null;
 const pageTokens  = new Map(); // pageId → token
 const sellerPages = new Map(); // sellerId → [pageIds]
 
-function savePageToken(sellerId, pageId, pageName, token) {
+async function savePageToken(sellerId, pageId, pageName, token) {
+  // Save in memory (for current session)
   pageTokens.set(pageId, token);
   if (!sellerPages.has(sellerId)) sellerPages.set(sellerId, []);
   if (!sellerPages.get(sellerId).includes(pageId)) {
     sellerPages.get(sellerId).push(pageId);
   }
-  console.log(`✅ Saved: ${pageName} (${pageId}) for seller ${sellerId}`);
+  
+  console.log(`✅ Saved to memory: ${pageName} (${pageId}) for seller ${sellerId}`);
+  
+  // Save to database (persistent)
+  try {
+    await axios.patch(`${BASE_URL}/api/sellers/${sellerId}`, {
+      page_id: pageId,
+      page_access_token: token,
+    }, {
+      headers: { 
+        "Content-Type": "application/json",
+        "x-api-key": WEBHOOK_API_KEY 
+      },
+      timeout: 8000,
+    });
+    console.log(`✅ Saved to DB: ${pageName} (${pageId})`);
+  } catch (err) {
+    console.error("❌ Failed to save token to DB:", err.response?.data || err.message);
+  }
 }
 
-function getPageToken(pageId) {
-  return pageTokens.get(pageId) || null;
+async function getPageToken(pageId) {
+  // Check memory first
+  if (pageTokens.has(pageId)) {
+    return pageTokens.get(pageId);
+  }
+  
+  // If not in memory, fetch from database
+  try {
+    const res = await axios.get(`${BASE_URL}/api/public/get-sellers`, {
+      headers: { "x-api-key": WEBHOOK_API_KEY },
+      timeout: 8000,
+    });
+    
+    // Find the seller with matching page_id
+    const sellers = res.data || [];
+    const seller = sellers.find(s => s.page_id === pageId);
+    
+    if (seller?.page_access_token) {
+      // Save to memory for faster access
+      pageTokens.set(pageId, seller.page_access_token);
+      console.log(`✅ Loaded token from DB for page ${pageId}`);
+      return seller.page_access_token;
+    }
+  } catch (err) {
+    console.error("❌ Failed to fetch token from DB:", err.response?.data || err.message);
+  }
+  
+  return null;
+}
+
+/* ==================== LOAD ALL TOKENS ON STARTUP ==================== */
+async function loadAllTokensFromDB() {
+  try {
+    console.log("🔄 Loading tokens from database...");
+    const res = await axios.get(`${BASE_URL}/api/public/get-sellers`, {
+      headers: { "x-api-key": WEBHOOK_API_KEY },
+      timeout: 10000,
+    });
+    
+    const sellers = res.data || [];
+    let loaded = 0;
+    
+    for (const seller of sellers) {
+      if (seller.page_id && seller.page_access_token) {
+        pageTokens.set(seller.page_id, seller.page_access_token);
+        
+        if (!sellerPages.has(seller.seller_id)) {
+          sellerPages.set(seller.seller_id, []);
+        }
+        if (!sellerPages.get(seller.seller_id).includes(seller.page_id)) {
+          sellerPages.get(seller.seller_id).push(seller.page_id);
+        }
+        
+        loaded++;
+        console.log(`  ✓ Loaded token for page ${seller.page_id} (seller: ${seller.seller_id})`);
+      }
+    }
+    
+    console.log(`✅ Loaded ${loaded} page tokens from database`);
+  } catch (err) {
+    console.error("❌ Failed to load tokens from DB:", err.response?.data || err.message);
+  }
 }
 
 /* ==================== MEMORY ==================== */
@@ -164,7 +243,6 @@ function L(lang, bn, bl, en) {
 /* ==================== SMART AI (NO HARDCODED RESPONSES) ==================== */
 async function getSmartReply(userMessage, session, products) {
   if (!groq) {
-    // Fallback without AI
     return "দুঃখিত, আমি এখন AI ছাড়া চলছি। প্রোডাক্টের নাম বলুন বা 'list' লিখুন।";
   }
 
@@ -275,7 +353,11 @@ async function sendOrderAlert(senderId, product, detailsText) {
 
 /* ==================== FACEBOOK SEND ==================== */
 async function sendMessage(senderId, text, token) {
-  if (!token) return console.error("No token to send message");
+  if (!token) {
+    console.error(`❌ No token to send message to ${senderId}`);
+    return;
+  }
+  
   const chunks = [];
   let t = text;
   while (t.length > 1900) {
@@ -284,6 +366,7 @@ async function sendMessage(senderId, text, token) {
     t = t.slice(cut > 0 ? cut : 1900).trim();
   }
   if (t.length) chunks.push(t);
+  
   for (const chunk of chunks) {
     try {
       await axios.post("https://graph.facebook.com/v19.0/me/messages",
@@ -383,7 +466,7 @@ app.get("/auth/facebook", (req, res) => {
   if (!seller_id) return res.status(400).send("Missing seller_id");
   
   const redirectUri = `${req.protocol}://${req.get('host')}/auth/facebook/callback`;
-  const state = seller_id; // Use seller_id as state
+  const state = seller_id;
   const fbAuthUrl = `https://www.facebook.com/v19.0/dialog/oauth?client_id=${FACEBOOK_APP_ID}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=pages_show_list,pages_messaging,pages_read_engagement&state=${state}`;
   
   res.redirect(fbAuthUrl);
@@ -422,11 +505,11 @@ app.get("/auth/facebook/callback", async (req, res) => {
       return res.redirect(`${FRONTEND_URL}/integrations?error=no_pages`);
     }
 
-    const sellerId = state; // seller_id from state
+    const sellerId = state;
     
     // Save all pages
     for (const page of pagesRes.data.data) {
-      savePageToken(sellerId, page.id, page.name, page.access_token);
+      await savePageToken(sellerId, page.id, page.name, page.access_token);
       
       // Subscribe page to webhook
       try {
@@ -494,7 +577,7 @@ app.post("/webhook", async (req, res) => {
           } else {
             reply = analysis.reply || L(session.lang,
               "এই পণ্যটি আমাদের কাছে নেই। অন্য কিছু দেখতে চান? 😊",
-              "Ei pọnno amader kache nai. Onno kisu dekhte chan? 😊",
+              "Ei ponno amader kache nai. Onno kisu dekhte chan? 😊",
               "This isn't in our shop. Want to see something else? 😊"
             );
           }
@@ -503,11 +586,11 @@ app.post("/webhook", async (req, res) => {
         }
 
         if (reply) {
-          const token = getPageToken(pageId);
+          const token = await getPageToken(pageId);
           if (token) {
             await sendMessage(senderId, reply, token);
           } else {
-            console.error(`❌ No token for page ${pageId}`);
+            console.error(`❌ No token for page ${pageId} - user may need to reconnect`);
           }
         }
       }
@@ -518,7 +601,7 @@ app.post("/webhook", async (req, res) => {
 });
 
 app.get("/", (req, res) => res.json({
-  status: "✅ BizAssist Smart Bot v5.0",
+  status: "✅ BizAssist Smart Bot v6.0 (Persistent Tokens)",
   uptime: process.uptime(),
   products: productCache.data.length,
   sessions: userSessions.size,
@@ -526,4 +609,7 @@ app.get("/", (req, res) => res.json({
 }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Smart Bot v5.0 on port ${PORT}`));
+app.listen(PORT, async () => {
+  console.log(`🚀 Smart Bot v6.0 on port ${PORT}`);
+  await loadAllTokensFromDB();
+});
